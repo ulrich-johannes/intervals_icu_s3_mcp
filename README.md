@@ -22,6 +22,8 @@ Fly.io deploys directly from a GitHub repository, so you need your own copy of t
 2. Click the **Fork** button near the top right of the page.
 3. Click **Create fork**. GitHub creates a copy of this project under your own account — you now have your own GitHub link to it, something like `https://github.com/your-name/intervals_icu_s3_mcp`.
 
+This copy doesn't go stale forever — see [Part 9](#part-9--keeping-it-up-to-date) for the one-click way to pull in future updates whenever we improve this project.
+
 ---
 
 ## Part 2 — Get your intervals.icu credentials
@@ -109,7 +111,9 @@ If Part 5's bucket wasn't attached automatically, also add these (copied from th
 Adding secrets doesn't automatically restart the app. On your app's Fly.io dashboard page, look for a **Redeploy** or **Restart** button and click it. Give it a minute, then check it worked:
 
 1. Open a new browser tab and go to `https://YOUR-APP-NAME.fly.dev/health` (using your actual app name from Part 4).
-2. You should see `{"status":"ok"}`. If you do, it worked! 🎉
+2. You should see `{"status":"ok","configured":true}`. If you do, it worked! 🎉
+
+If you instead see `"configured":false` and a `"missing"` list, the app is running fine but is still missing one or more secrets — the list names exactly which ones. Go back to Part 6, add those, and redeploy again. You'll see the same thing if you connect it to Claude too early: Claude will only see one tool, called `check_configuration`, which tells you the same thing.
 
 ---
 
@@ -126,7 +130,19 @@ Adding secrets doesn't automatically restart the app. On your app's Fly.io dashb
 
 ---
 
-## Part 9 — What each secret means
+## Part 9 — Keeping it up to date
+
+Your fork is its own separate copy, so when this project gets improved, those changes don't reach your fork by themselves. Getting them is a single click, whenever you feel like checking:
+
+1. Open your fork's GitHub page (`https://github.com/your-name/intervals_icu_s3_mcp`).
+2. If it's behind, GitHub shows a **"Sync fork"** button (sometimes under a small banner saying "This branch is X commits behind..."). Click it, then click **Update branch**.
+3. That's it — this pushes the update into your fork's `main` branch, which Fly.io is already watching (Part 4), so it redeploys automatically within a minute or two. No further clicking needed.
+
+This is a manual check-in, not something that happens on its own — nothing will ping you when an update is available. If you want to be sure you're current, it's worth glancing at your fork's GitHub page every so often.
+
+---
+
+## Part 10 — What each secret means
 
 | Secret | Where it comes from | What it's for |
 | --- | --- | --- |

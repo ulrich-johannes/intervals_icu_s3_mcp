@@ -103,14 +103,15 @@ The abstraction layer (§03) tells us *where* upstream changes land; this suite 
 
 Separate from the upstream-contract suite above: every module we actually write gets ordinary unit tests, same as any other codebase — these aren't optional or an afterthought bolted onto the upstream-regression story.
 
-- `tests/test_config.py` — env var loading/validation (`config.py`): required vars missing → clean failure at boot; `INTERVALS_ICU_DELETE_MODE` and other enum-like values validated; no var leaks into logs.
+- `tests/test_config.py` — env var loading/validation (`config.py`): a missing variable never raises (§13), `missing_env_vars()` reports it by name, an invalid `PORT` falls back to the default instead of crashing.
+- `tests/test_server.py` — `build_app()`'s branching (§13): fully configured exposes the real tool set; missing one of ours, or missing an intervals.icu credential, serves only `check_configuration` with the right names in its `missing` list; `/health` reflects the same.
 - `tests/test_auth.py` — the self-issued OAuth provider (`auth.py`): DCR issues a client id; `/authorize` with a bad redirect URI is rejected; `/login` with wrong credentials fails and right credentials completes the redirect with a code; PKCE verification at `/token`; issued tokens expire after their TTL; no refresh-token path exists.
 - `tests/test_s3store.py` — the `state_*` tool implementations (`s3store.py`), against a mocked/fake S3 client (e.g. `moto` or a hand-rolled in-memory stub, not a real Tigris bucket): create/get/update/delete/list semantics, conflict-on-create-over-existing, soft-delete round-trip, `include_deleted` filtering, not-found on deleted or missing keys.
 - These run in the same CI job as the upstream-contract suite (§04 above) and gate every PR, not just submodule bumps.
 
 ## 05 Configuration
 
-All env-driven, loaded via `fly secrets set` in production, validated eagerly at boot (mirrors datastore-mcp's `config.ts` pattern, ported to `pydantic-settings`).
+All env-driven, loaded via Fly's dashboard Secrets tab in production. **Revised from datastore-mcp's pattern**: a missing or invalid variable does not crash the process at boot. See §14.
 
 | Variable | Source | Notes |
 | --- | --- | --- |
@@ -188,7 +189,24 @@ Carried over from datastore-mcp, plus new ones specific to this project:
 4. **Regression suite scope at launch** — start with the contract/integration/e2e-smoke tests in §04; decide later whether to also pin and test against upstream's own `tests/smoke_eval.json` fixtures for extra coverage.
 5. **Keeping the vendored copy current** — no automated staleness check exists yet; relies on a maintainer periodically re-vendoring (§03). Worth a reminder/cadence once this is in real use.
 
-## 12 Proposed repository layout
+## 13 Graceful misconfiguration handling
+
+**Revised from datastore-mcp's "crash immediately with a named error" pattern** (its §09 field note #1). That's the right call for a developer debugging a boot failure in Fly's logs; it's the wrong call for a non-technical person who deployed via README.md's click-only flow and has no logs they'd know how to read — a crash-looping machine with no visible reason is a dead end for them.
+
+Instead, `config.py`'s `Settings` model has no required fields — every one of ours (`PUBLIC_URL`, `OAUTH_USERNAME`, `OAUTH_PASSWORD`, `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) defaults to `None` rather than raising if unset, and a malformed `PORT` silently falls back to `8080` rather than raising. `server.py`'s `build_app()` then checks, up front:
+
+- `config.missing_env_vars(settings)` — our own required variables.
+- `upstream.missing_intervals_config()` — reads upstream's own `ICUConfig` directly (via `load_config()`) to report `INTERVALS_ICU_API_KEY` / `INTERVALS_ICU_ATHLETE_ID` specifically, rather than letting a tool call fail opaquely against upstream's own HTTP client later.
+
+If anything is missing, **no real tool is registered at all** — not partially, not with a generic error wrapper around each one. Instead the app serves `build_misconfigured_app()`: a FastMCP instance with no OAuth (there's nothing valid to gate against if the OAuth variables themselves are what's missing), one tool (`check_configuration`) that returns the exact missing variable names and what to do about them, the same list surfaced on the FastMCP `instructions` field (shown to the client/model on `initialize`), and `/health` returning `{"status": "ok", "configured": false, "missing": [...]}` instead of a bare `{"status": "ok"}` — so a deployer can check progress just by opening that URL in a browser, without connecting Claude at all.
+
+Once everything required is present, `build_configured_app()` runs exactly as described in §02–§08 — this is purely an up-front gate, not a change to the real app's behavior.
+
+## 14 Keeping a fork current
+
+README.md has the end user fork this repository (rather than deploy from the upstream repo directly) so that Fly's GitHub integration has a repository they actually have push access to connect to. The cost: a fork is a frozen snapshot, so improvements to this project don't reach a deployed instance by themselves. The fix adopted is GitHub's own one-click **"Sync fork" → "Update branch"** button — this fast-forwards the fork's `main` to match upstream, which is a normal push, so Fly's existing continuous-deployment hook (set up once in §09/§13) redeploys automatically from it. No CLI either way, but it is explicitly a manual check-in: nothing notifies the user that an update exists. Documented as a trade-off, not hidden as "automatic."
+
+## 15 Proposed repository layout
 
 ```
 pyproject.toml
@@ -200,6 +218,7 @@ src/intervals_icu_s3_mcp/
   config.py          # env var loading/validation
 tests/
   test_config.py                # unit tests for config.py
+  test_server.py                # §13 — configured vs. misconfigured branching
   test_auth.py                  # unit tests for the OAuth provider
   test_s3store.py               # unit tests for state_* tools, mocked S3
   test_upstream_contract.py     # §04 — tool existence/shape vs. vendored package

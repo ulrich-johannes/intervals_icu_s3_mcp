@@ -1,15 +1,22 @@
 """Composition root: wires OAuth, the upstream intervals.icu tools, and our
 own S3-backed state_* tools onto one FastMCP instance.
 
-See SPECIFICATION.md for the overall design. This module should stay thin --
-it only composes; the OAuth logic lives in auth.py, upstream integration in
-upstream.py, S3 tool logic in s3store.py, and config loading in config.py.
+See SPECIFICATION.md §14 for why there's a second, "misconfigured" app
+here: a missing or invalid environment variable must never crash the
+process or leave Fly in a silent crash loop. Instead the app always
+starts, and if required configuration is missing, every MCP endpoint
+instead serves a clear explanation of exactly what to fix -- important for
+a non-technical deployer working only from Fly's dashboard, with no logs
+they'd know how to read.
+
+This module should stay thin -- it only composes; the OAuth logic lives in
+auth.py, upstream integration in upstream.py, S3 tool logic in s3store.py,
+and config loading in config.py.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from typing import Any
 
 from fastmcp import FastMCP
@@ -17,29 +24,67 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .auth import SingleUserOAuthProvider
-from .config import MissingConfigError, Settings, load_settings
+from .config import Settings, load_settings, missing_env_vars
 from .s3store import StateConflictError, StateNotFoundError, StateStore
-from .upstream import mount_upstream_tools
+from .upstream import missing_intervals_config, mount_upstream_tools
 
 
 def build_app(settings: Settings) -> FastMCP:
+    """Build the real app, or a clear "not configured" stand-in for it.
+
+    Every required environment variable (ours in config.py, plus
+    upstream's intervals.icu credentials) is checked up front. If any are
+    missing, none of the real tools are registered at all -- they would
+    just fail confusingly against an unconfigured S3 bucket or
+    intervals.icu account -- and the server instead exposes exactly one
+    tool that explains what's missing.
+    """
+    missing = missing_env_vars(settings) + missing_intervals_config()
+    if missing:
+        return build_misconfigured_app(missing)
+    return build_configured_app(settings)
+
+
+def build_misconfigured_app(missing: list[str]) -> FastMCP:
+    message = (
+        "This intervals-icu-s3-mcp server is not configured yet. "
+        f"Missing or invalid environment variable(s): {', '.join(missing)}. "
+        "An admin needs to set these as Secrets on the Fly.io dashboard -- "
+        "see README.md for what each one means and where to get it. "
+        "No tools are available until this is fixed."
+    )
+    mcp = FastMCP("intervals-icu-s3-mcp", instructions=message)
+
+    @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "configured": False, "missing": missing})
+
+    @mcp.tool
+    def check_configuration() -> dict[str, Any]:
+        """Call this first if no other tools seem to work -- explains why."""
+        return {"configured": False, "missing": missing, "message": message}
+
+    return mcp
+
+
+def build_configured_app(settings: Settings) -> FastMCP:
     auth = SingleUserOAuthProvider(
-        base_url=settings.public_url,
-        username=settings.oauth_username,
-        password=settings.oauth_password,
+        base_url=settings.public_url,  # type: ignore[arg-type]
+        username=settings.oauth_username,  # type: ignore[arg-type]
+        password=settings.oauth_password,  # type: ignore[arg-type]
     )
     mcp = FastMCP("intervals-icu-s3-mcp", auth=auth)
 
     @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "ok", "configured": True})
 
     @mcp.custom_route("/login", methods=["GET", "POST"], include_in_schema=False)
     async def login(request: Request):
         return await auth.handle_login(request)
 
     store = StateStore(
-        bucket=settings.bucket_name,
+        bucket=settings.bucket_name,  # type: ignore[arg-type]
         aws_access_key_id=settings.aws_access_key_id,
         aws_secret_access_key=settings.aws_secret_access_key,
         endpoint_url=settings.aws_endpoint_url_s3,
@@ -111,11 +156,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    try:
-        settings = load_settings()
-    except MissingConfigError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    settings = load_settings()
 
     mcp = build_app(settings)
     port = args.port if args.port is not None else settings.port

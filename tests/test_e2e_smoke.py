@@ -26,6 +26,12 @@ from intervals_icu_s3_mcp.server import build_app
 BUCKET = "e2e-test-bucket"
 
 
+@pytest.fixture(autouse=True)
+def _intervals_icu_env(monkeypatch):
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test-key")
+    monkeypatch.setenv("INTERVALS_ICU_ATHLETE_ID", "i123456")
+
+
 @pytest.fixture
 def settings():
     return Settings(

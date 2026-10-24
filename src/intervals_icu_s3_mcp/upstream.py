@@ -42,3 +42,21 @@ def mount_upstream_tools(mcp: FastMCP) -> None:
     collision with our own `/health` handler in server.py.
     """
     mcp.mount(get_upstream_mcp())
+
+
+def missing_intervals_config() -> list[str]:
+    """Names of intervals.icu environment variables that are unset or invalid.
+
+    Used by server.py at startup to decide whether to serve the real app
+    or the "not configured" one (SPECIFICATION.md §14). Reads upstream's
+    own config loader rather than duplicating its env var names here.
+    """
+    from intervals_icu_mcp.auth import load_config
+
+    config = load_config()
+    missing: list[str] = []
+    if not config.intervals_icu_api_key or config.intervals_icu_api_key == "your_api_key_here":
+        missing.append("INTERVALS_ICU_API_KEY")
+    if not config.intervals_icu_athlete_id:
+        missing.append("INTERVALS_ICU_ATHLETE_ID")
+    return missing
