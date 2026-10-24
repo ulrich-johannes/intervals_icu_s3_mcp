@@ -1,0 +1,1766 @@
+"""Tests for event management tools."""
+
+import json
+from datetime import date, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from httpx import Response
+
+from intervals_icu_mcp.auth import ICUConfig
+from intervals_icu_mcp.tools.event_management import (
+    _count_workout_steps,
+    _swim_work_lacks_intensity,
+    apply_training_plan,
+    bulk_create_events,
+    bulk_delete_events,
+    bulk_update_event_access,
+    create_event,
+    delete_event,
+    duplicate_events,
+    update_event,
+)
+
+
+def _future_date(days: int = 7) -> str:
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
+def _past_date(days: int = 7) -> str:
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
+@pytest.fixture
+def mock_config_full():
+    """Config with delete_mode=full for tests that bypass the safe-mode guard."""
+    return ICUConfig(
+        intervals_icu_api_key="test_api_key_12345",
+        intervals_icu_athlete_id="i123456",
+        intervals_icu_delete_mode="full",
+    )
+
+
+class TestEventTools:
+    """Tests for event tools."""
+
+    async def test_create_event_success(self, mock_config, respx_mock):
+        """Test successful event creation."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "name": "New Workout",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+
+        result = await create_event(
+            start_date="2026-03-20",
+            name="New Workout",
+            category="WORKOUT",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "data" in response
+        assert response["data"]["id"] == 1001
+        assert response["data"]["name"] == "New Workout"
+        assert response["metadata"]["message"] == "Successfully created workout: New Workout"
+
+    async def test_update_event_success(self, mock_config, respx_mock):
+        """Test successful event update."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "name": "Updated Workout",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+
+        result = await update_event(
+            event_id=1001,
+            name="Updated Workout",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "data" in response
+        assert response["data"]["id"] == 1001
+        assert response["data"]["name"] == "Updated Workout"
+        assert response["metadata"]["message"] == "Successfully updated event 1001"
+
+    async def test_delete_event_safe_allows_future(self, mock_config, respx_mock):
+        """Safe mode (default): future event is fetched, then deleted."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.get("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "start_date_local": _future_date(),
+                    "name": "Tomorrow's workout",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+        respx_mock.delete("/athlete/i123456/events/1001").mock(return_value=Response(200, json={}))
+
+        result = await delete_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "data" in response
+        assert response["data"]["deleted"] == [1001]
+        assert response["data"]["deleted_count"] == 1
+        assert response["data"]["skipped"] == []
+        assert response["data"]["skipped_count"] == 0
+
+    async def test_delete_event_safe_refuses_past(self, mock_config, respx_mock):
+        """Safe mode: past event is skipped with reason=past_event."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        past = _past_date()
+        respx_mock.get("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "start_date_local": past,
+                    "name": "Last week",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+        delete_route = respx_mock.delete("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json={})
+        )
+
+        result = await delete_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted"] == []
+        assert response["data"]["deleted_count"] == 0
+        assert len(response["data"]["skipped"]) == 1
+        skip = response["data"]["skipped"][0]
+        assert skip["id"] == 1001
+        assert skip["reason"] == "past_event"
+        assert skip["start_date_local"] == past
+        assert "INTERVALS_ICU_DELETE_MODE=full" in skip["hint"]
+        assert delete_route.call_count == 0
+
+    async def test_delete_event_safe_treats_today_as_past(self, mock_config, respx_mock):
+        """One-day buffer: today's events are refused to absorb TZ skew."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        today = date.today().isoformat()
+        respx_mock.get("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "start_date_local": today,
+                    "name": "Today",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+        delete_route = respx_mock.delete("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json={})
+        )
+
+        result = await delete_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted"] == []
+        assert response["data"]["skipped"][0]["reason"] == "past_event"
+        assert delete_route.call_count == 0
+
+    async def test_delete_event_safe_skips_unparseable_date(self, mock_config, respx_mock):
+        """Safe mode: event with an unparseable date is skipped (cannot verify)."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.get("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "start_date_local": "not-a-date",
+                    "name": "Bad date",
+                    "category": "NOTE",
+                },
+            )
+        )
+
+        result = await delete_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted_count"] == 0
+        assert response["data"]["skipped"][0]["reason"] == "missing_date"
+
+    async def test_delete_event_full_skips_date_check(self, mock_config_full, respx_mock):
+        """Full mode: no fetch, deletes regardless of date."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config_full)
+
+        get_route = respx_mock.get("/athlete/i123456/events/1001")
+        respx_mock.delete("/athlete/i123456/events/1001").mock(return_value=Response(200, json={}))
+
+        result = await delete_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted"] == [1001]
+        assert get_route.call_count == 0
+
+    async def test_apply_training_plan_success(self, mock_config, respx_mock):
+        """Test successful training plan application."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.post("/athlete/i123456/events/apply-plan").mock(
+            return_value=Response(200, json=[{"id": 1002, "name": "Plan Workout"}])
+        )
+
+        result = await apply_training_plan(
+            folder_id=500,
+            start_date_local="2026-04-01",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "data" in response
+        assert response["data"][0]["name"] == "Plan Workout"
+        assert response["metadata"]["message"] == "Successfully applied training plan folder 500"
+
+    async def test_create_event_rejects_invalid_category(self, mock_config):
+        """Validation: invalid category returns an error without hitting the API."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Bad Event",
+            category="PARTY",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "Invalid category" in response["error"]["message"]
+        # Error message lists the new category enum
+        assert "INJURED" in response["error"]["message"]
+        assert "HOLIDAY" in response["error"]["message"]
+
+    async def test_create_event_injury_with_date_range(self, mock_config, respx_mock):
+        """INJURED block with end_date and training_availability is forwarded correctly."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 5001,
+                    "name": "Knieprobleme",
+                    "start_date_local": "2026-04-25T00:00:00",
+                    "end_date_local": "2026-05-05T00:00:00",
+                    "category": "INJURED",
+                    "training_availability": "LIMITED",
+                },
+            )
+        )
+
+        result = await create_event(
+            start_date="2026-04-25",
+            name="Knieprobleme",
+            category="INJURED",
+            end_date="2026-05-05",
+            training_availability="limited",
+            ctx=mock_ctx,
+        )
+
+        # Outgoing payload assertions
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["category"] == "INJURED"
+        assert sent["start_date_local"] == "2026-04-25T00:00:00"
+        assert sent["end_date_local"] == "2026-05-05T00:00:00"
+        assert sent["training_availability"] == "LIMITED"
+
+        # Response shape
+        response = json.loads(result)
+        assert response["data"]["category"] == "INJURED"
+        assert response["data"]["end_date"] == "2026-05-05T00:00:00"
+        assert response["data"]["training_availability"] == "LIMITED"
+
+    async def test_create_event_holiday_with_unavailable(self, mock_config, respx_mock):
+        """HOLIDAY with training_availability=UNAVAILABLE is accepted."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 5002,
+                    "name": "Spring Break",
+                    "start_date_local": "2026-05-01T00:00:00",
+                    "end_date_local": "2026-05-08T00:00:00",
+                    "category": "HOLIDAY",
+                    "training_availability": "UNAVAILABLE",
+                },
+            )
+        )
+
+        await create_event(
+            start_date="2026-05-01",
+            name="Spring Break",
+            category="HOLIDAY",
+            end_date="2026-05-08",
+            training_availability="UNAVAILABLE",
+            ctx=mock_ctx,
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["category"] == "HOLIDAY"
+        assert sent["training_availability"] == "UNAVAILABLE"
+
+    async def test_create_event_legacy_race_alias(self, mock_config, respx_mock):
+        """Legacy 'RACE' is normalized to 'RACE_A' before sending."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 5003,
+                    "name": "Goal Race",
+                    "start_date_local": "2026-06-01T00:00:00",
+                    "category": "RACE_A",
+                    "type": "Run",
+                },
+            )
+        )
+
+        await create_event(
+            start_date="2026-06-01",
+            name="Goal Race",
+            category="RACE",
+            event_type="Run",
+            ctx=mock_ctx,
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["category"] == "RACE_A"
+        assert sent["type"] == "Run"
+
+    async def test_create_event_race_without_type_is_rejected(self, mock_config):
+        """Validation: RACE_A/B/C without event_type returns helpful error pre-flight."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await create_event(
+            start_date="2026-09-13",
+            name="Otztaler",
+            category="RACE_A",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        message = response["error"]["message"]
+        assert "event_type" in message
+        assert "RACE_A" in message
+        # Hint lists the valid disciplines
+        assert "Ride" in message and "Run" in message
+
+    async def test_bulk_create_events_race_without_type_is_rejected(self, mock_config):
+        """Validation: bulk RACE_A entry without 'type' is rejected pre-flight."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        events_payload = json.dumps(
+            [
+                {
+                    "start_date_local": "2026-09-13",
+                    "name": "Otztaler",
+                    "category": "RACE_A",
+                },
+            ]
+        )
+
+        result = await bulk_create_events(events=events_payload, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "type" in response["error"]["message"]
+        assert "RACE_A" in response["error"]["message"]
+
+    async def test_create_event_legacy_goal_alias(self, mock_config, respx_mock):
+        """Legacy 'GOAL' is normalized to 'TARGET' before sending."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 5004,
+                    "name": "Sub-3 marathon",
+                    "start_date_local": "2026-09-01T00:00:00",
+                    "category": "TARGET",
+                },
+            )
+        )
+
+        await create_event(
+            start_date="2026-09-01",
+            name="Sub-3 marathon",
+            category="goal",
+            ctx=mock_ctx,
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["category"] == "TARGET"
+
+    async def test_create_event_rejects_invalid_availability(self, mock_config):
+        """Validation: bogus training_availability is rejected without API call."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await create_event(
+            start_date="2026-04-25",
+            name="Knee",
+            category="INJURED",
+            training_availability="MAYBE",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "training_availability" in response["error"]["message"]
+
+    async def test_create_event_rejects_invalid_end_date(self, mock_config):
+        """Validation: malformed end_date is rejected without API call."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await create_event(
+            start_date="2026-04-25",
+            name="Knee",
+            category="INJURED",
+            end_date="not-a-date",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "end_date" in response["error"]["message"]
+
+    async def test_update_event_can_set_end_date_and_availability(self, mock_config, respx_mock):
+        """Updating an injury block to extend its end_date and change availability."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.put("/athlete/i123456/events/5001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 5001,
+                    "name": "Knieprobleme",
+                    "start_date_local": "2026-04-25T00:00:00",
+                    "end_date_local": "2026-05-15T00:00:00",
+                    "category": "INJURED",
+                    "training_availability": "NORMAL",
+                },
+            )
+        )
+
+        result = await update_event(
+            event_id=5001,
+            end_date="2026-05-15",
+            training_availability="NORMAL",
+            ctx=mock_ctx,
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["end_date_local"] == "2026-05-15T00:00:00"
+        assert sent["training_availability"] == "NORMAL"
+
+        response = json.loads(result)
+        assert response["data"]["end_date"] == "2026-05-15T00:00:00"
+        assert response["data"]["training_availability"] == "NORMAL"
+
+    async def test_create_event_rejects_invalid_date(self, mock_config):
+        """Validation: malformed start_date returns an error without hitting the API."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await create_event(
+            start_date="not-a-date",
+            name="Workout",
+            category="WORKOUT",
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "Invalid date format" in response["error"]["message"]
+
+    async def test_update_event_requires_at_least_one_field(self, mock_config):
+        """Validation: update with no fields returns an error."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await update_event(event_id=1001, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "No fields provided" in response["error"]["message"]
+
+    async def test_delete_event_api_error(self, mock_config_full, respx_mock):
+        """API 404 on delete surfaces as error response (full mode bypasses get_event)."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config_full)
+
+        respx_mock.delete("/athlete/i123456/events/9999").mock(
+            return_value=Response(404, json={"error": "Event not found"})
+        )
+
+        result = await delete_event(event_id=9999, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "Resource not found" in response["error"]["message"]
+
+    async def test_bulk_create_events_success(self, mock_config, respx_mock):
+        """Bulk create events returns the full list with count metadata."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {
+                        "id": 2001,
+                        "start_date_local": "2026-04-01",
+                        "name": "Mon Workout",
+                        "category": "WORKOUT",
+                        "type": "Ride",
+                    },
+                    {
+                        "id": 2002,
+                        "start_date_local": "2026-04-03",
+                        "name": "Wed Workout",
+                        "category": "WORKOUT",
+                        "type": "Ride",
+                    },
+                ],
+            )
+        )
+
+        events_payload = json.dumps(
+            [
+                {
+                    "start_date_local": "2026-04-01",
+                    "name": "Mon Workout",
+                    "category": "workout",
+                    "event_type": "Ride",
+                },
+                {
+                    "start_date_local": "2026-04-03",
+                    "name": "Wed Workout",
+                    "category": "WORKOUT",
+                    "event_type": "Ride",
+                },
+            ]
+        )
+
+        result = await bulk_create_events(events=events_payload, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "data" in response
+        assert len(response["data"]["events"]) == 2
+        assert response["metadata"]["count"] == 2
+        assert response["metadata"]["message"] == "Successfully created 2 events"
+
+    async def test_bulk_create_events_supports_injury_block(self, mock_config, respx_mock):
+        """Bulk create forwards INJURED + end_date_local + training_availability."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {
+                        "id": 6001,
+                        "start_date_local": "2026-04-25T00:00:00",
+                        "end_date_local": "2026-05-05T00:00:00",
+                        "name": "Knee",
+                        "category": "INJURED",
+                        "training_availability": "LIMITED",
+                    },
+                ],
+            )
+        )
+
+        events_payload = json.dumps(
+            [
+                {
+                    "start_date_local": "2026-04-25",
+                    "end_date_local": "2026-05-05",
+                    "name": "Knee",
+                    "category": "injured",
+                    "training_availability": "limited",
+                },
+            ]
+        )
+
+        result = await bulk_create_events(events=events_payload, ctx=mock_ctx)
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent[0]["category"] == "INJURED"
+        assert sent[0]["start_date_local"] == "2026-04-25T00:00:00"
+        assert sent[0]["end_date_local"] == "2026-05-05T00:00:00"
+        assert sent[0]["training_availability"] == "LIMITED"
+
+        response = json.loads(result)
+        assert response["data"]["events"][0]["category"] == "INJURED"
+        assert response["data"]["events"][0]["end_date"] == "2026-05-05T00:00:00"
+        assert response["data"]["events"][0]["training_availability"] == "LIMITED"
+
+    async def test_bulk_create_events_rejects_invalid_availability(self, mock_config):
+        """Validation: bogus training_availability in a bulk entry is rejected."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        events_payload = json.dumps(
+            [
+                {
+                    "start_date_local": "2026-04-25",
+                    "name": "Knee",
+                    "category": "INJURED",
+                    "training_availability": "SOMETIMES",
+                },
+            ]
+        )
+
+        result = await bulk_create_events(events=events_payload, ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "training_availability" in response["error"]["message"]
+
+    async def test_bulk_create_events_rejects_invalid_json(self, mock_config):
+        """Validation: non-JSON input is rejected before any API call."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await bulk_create_events(events="not json", ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "Invalid JSON format" in response["error"]["message"]
+
+    async def test_bulk_create_events_requires_fields(self, mock_config):
+        """Validation: missing required per-event fields is rejected."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await bulk_create_events(
+            events=json.dumps([{"name": "Missing date and category"}]),
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "start_date_local" in response["error"]["message"]
+
+    async def test_bulk_delete_events_full_mode(self, mock_config_full, respx_mock):
+        """Full mode: deletes all IDs without per-event date check."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config_full)
+
+        respx_mock.put("/athlete/i123456/events/bulk-delete").mock(
+            return_value=Response(200, json={"deleted": 2})
+        )
+
+        result = await bulk_delete_events(event_ids=json.dumps([1001, 1002]), ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted"] == [1001, 1002]
+        assert response["data"]["deleted_count"] == 2
+        assert response["data"]["skipped"] == []
+        assert response["metadata"]["message"] == "Successfully deleted 2 events"
+
+    async def test_bulk_delete_events_safe_partition(self, mock_config, respx_mock):
+        """Safe mode: partitions input into deleted (future) and skipped (past)."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        future = _future_date()
+        past = _past_date()
+        respx_mock.get("/athlete/i123456/events/1001").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1001,
+                    "start_date_local": future,
+                    "name": "Future workout",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+        respx_mock.get("/athlete/i123456/events/1002").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 1002,
+                    "start_date_local": past,
+                    "name": "Past workout",
+                    "category": "WORKOUT",
+                },
+            )
+        )
+        bulk_route = respx_mock.put("/athlete/i123456/events/bulk-delete").mock(
+            return_value=Response(200, json={"deleted": 1})
+        )
+
+        result = await bulk_delete_events(event_ids=json.dumps([1001, 1002]), ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted"] == [1001]
+        assert response["data"]["deleted_count"] == 1
+        assert len(response["data"]["skipped"]) == 1
+        assert response["data"]["skipped"][0]["id"] == 1002
+        assert response["data"]["skipped"][0]["reason"] == "past_event"
+        sent = json.loads(bulk_route.calls.last.request.content)
+        sent_ids = [entry["id"] if isinstance(entry, dict) else entry for entry in sent]
+        assert sent_ids == [1001]
+
+    async def test_bulk_delete_events_safe_all_past(self, mock_config, respx_mock):
+        """Safe mode: when every input is past, no bulk-delete call is made."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        past = _past_date()
+        for eid in (1001, 1002):
+            respx_mock.get(f"/athlete/i123456/events/{eid}").mock(
+                return_value=Response(
+                    200,
+                    json={
+                        "id": eid,
+                        "start_date_local": past,
+                        "name": "Past",
+                        "category": "WORKOUT",
+                    },
+                )
+            )
+        bulk_route = respx_mock.put("/athlete/i123456/events/bulk-delete").mock(
+            return_value=Response(200, json={"deleted": 0})
+        )
+
+        result = await bulk_delete_events(event_ids=json.dumps([1001, 1002]), ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert response["data"]["deleted_count"] == 0
+        assert response["data"]["skipped_count"] == 2
+        assert bulk_route.call_count == 0
+
+    async def test_bulk_delete_events_requires_non_empty(self, mock_config):
+        """Validation: empty array is rejected."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await bulk_delete_events(event_ids=json.dumps([]), ctx=mock_ctx)
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "at least one event ID" in response["error"]["message"]
+
+    async def test_duplicate_events_success(self, mock_config, respx_mock):
+        """Duplicate events returns each copy with metadata echoing parameters."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.post("/athlete/i123456/duplicate-events").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {
+                        "id": 3001,
+                        "start_date_local": "2026-04-08",
+                        "name": "Copy 1",
+                        "category": "WORKOUT",
+                    },
+                    {
+                        "id": 3002,
+                        "start_date_local": "2026-04-15",
+                        "name": "Copy 2",
+                        "category": "WORKOUT",
+                    },
+                ],
+            )
+        )
+
+        result = await duplicate_events(
+            event_ids=json.dumps([1001]),
+            num_copies=2,
+            weeks_between=1,
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "data" in response
+        assert response["data"]["duplicated_count"] == 2
+        assert response["metadata"]["num_copies"] == 2
+        assert response["metadata"]["weeks_between"] == 1
+        assert response["metadata"]["original_event_ids"] == [1001]
+
+    async def test_duplicate_events_rejects_non_integer_ids(self, mock_config):
+        """Validation: non-integer entries in event_ids are rejected."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await duplicate_events(
+            event_ids=json.dumps(["not-an-int"]),
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "array of integers" in response["error"]["message"]
+
+    async def test_duplicate_events_rejects_zero_copies(self, mock_config):
+        """Validation: num_copies must be >= 1."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        result = await duplicate_events(
+            event_ids=json.dumps([1001]),
+            num_copies=0,
+            ctx=mock_ctx,
+        )
+
+        response = json.loads(result)
+        assert "error" in response
+        assert "num_copies must be at least 1" in response["error"]["message"]
+
+
+# workout_doc as Intervals.icu returns it: `steps` populated when the description
+# parses (repeat blocks carry `reps` + nested `steps`), empty list when it doesn't.
+WORKOUT_DOC_STRUCTURED = {
+    "duration": 4560,
+    "steps": [
+        {"duration": 900, "warmup": True, "power": {"start": 45, "end": 65, "units": "%ftp"}},
+        {
+            "reps": 5,
+            "text": "Main 5x",
+            "duration": 1800,
+            "steps": [
+                {"duration": 180, "power": {"value": 110, "units": "%ftp"}},
+                {"duration": 180, "power": {"value": 50, "units": "%ftp"}},
+            ],
+        },
+        {"duration": 600, "cooldown": True, "power": {"value": 45, "units": "%ftp"}},
+    ],
+}
+WORKOUT_DOC_EMPTY = {"duration": 0, "steps": []}
+
+
+class TestWorkoutParseEcho:
+    """Parse-status echo for WORKOUT events (workout_doc -> workout_parsed)."""
+
+    def test_count_workout_steps_expands_repeats(self):
+        # warmup(1) + 5x[2] (10) + cooldown(1) = 12
+        assert _count_workout_steps(WORKOUT_DOC_STRUCTURED["steps"]) == 12
+        assert _count_workout_steps([]) == 0
+        assert _count_workout_steps([{"duration": 300}]) == 1
+
+    async def test_create_workout_echoes_parsed(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 2001,
+                    "name": "Intervals",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "description": "Main 5x\n- 3m 110%\n- 3m 50%",
+                    "workout_doc": WORKOUT_DOC_STRUCTURED,
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Intervals",
+            category="WORKOUT",
+            description="Main 5x\n- 3m 110%\n- 3m 50%",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert data["workout_parsed"] is True
+        assert data["workout_steps"] == 12
+        assert "workout_parse_hint" not in data
+
+    async def test_create_workout_echoes_unparsed_prose(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 2002,
+                    "name": "Easy run",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "description": "Nice and easy run for half an hour.",
+                    "workout_doc": WORKOUT_DOC_EMPTY,
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Easy run",
+            category="WORKOUT",
+            description="Nice and easy run for half an hour.",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert data["workout_parsed"] is False
+        assert "workout_parse_hint" in data
+        assert "workout_steps" not in data
+
+    async def test_update_workout_echoes_parse_status(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.put("/athlete/i123456/events/2003").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 2003,
+                    "name": "Intervals",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "description": "Main 5x\n- 3m 110%\n- 3m 50%",
+                    "workout_doc": WORKOUT_DOC_STRUCTURED,
+                },
+            )
+        )
+        result = await update_event(
+            event_id=2003,
+            description="Main 5x\n- 3m 110%\n- 3m 50%",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert data["workout_parsed"] is True
+        assert data["workout_steps"] == 12
+
+    async def test_note_has_no_parse_echo(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 2004,
+                    "name": "Hydrate",
+                    "start_date_local": "2026-03-20",
+                    "category": "NOTE",
+                    "description": "Remember to hydrate.",
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Hydrate",
+            category="NOTE",
+            description="Remember to hydrate.",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert "workout_parsed" not in data
+        assert "workout_parse_hint" not in data
+
+
+class TestBulkFieldNameUnification:
+    """bulk_create_events takes the same field names as icu_create_event (5.0.0)."""
+
+    async def test_event_type_alias_mapped_to_api_type(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {
+                        "id": 3001,
+                        "name": "Run",
+                        "start_date_local": "2026-03-20",
+                        "category": "WORKOUT",
+                        "type": "Run",
+                    }
+                ],
+            )
+        )
+        result = await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-03-20",
+                        "name": "Run",
+                        "category": "WORKOUT",
+                        "event_type": "Run",
+                    }
+                ]
+            ),
+            ctx=mock_ctx,
+        )
+        assert "error" not in json.loads(result)
+        # The outgoing API payload must carry `type`, not the alias.
+        sent = json.loads(route.calls.last.request.content)
+        assert sent[0]["type"] == "Run"
+        assert "event_type" not in sent[0]
+
+    async def test_raw_api_names_are_rejected(self, mock_config, respx_mock):
+        """5.0.0: raw API names are refused, not ignored. Every one of them would
+        otherwise pass straight through to the API and keep working, leaving a second
+        undocumented vocabulary alive."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(200, json=[])
+        )
+        result = await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-03-20",
+                        "name": "R",
+                        "category": "WORKOUT",
+                        "moving_time": 3600,
+                    }
+                ]
+            ),
+            ctx=mock_ctx,
+        )
+        response = json.loads(result)
+        assert response["error"]["type"] == "validation_error"
+        # The error names the replacement rather than just refusing.
+        assert "moving_time -> duration_seconds" in response["error"]["message"]
+        assert not route.calls
+
+    async def test_friendly_names_map_to_api_fields(self, mock_config, respx_mock):
+        """duration_seconds/distance_meters/training_load reach the API under its names."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(200, json=[])
+        )
+        await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-03-20",
+                        "name": "R",
+                        "category": "WORKOUT",
+                        "event_type": "Ride",
+                        "duration_seconds": 3600,
+                        "distance_meters": 40000,
+                        "training_load": 75,
+                    }
+                ]
+            ),
+            ctx=mock_ctx,
+        )
+        sent = json.loads(route.calls.last.request.content)[0]
+        assert sent["type"] == "Ride"
+        assert sent["moving_time"] == 3600
+        assert sent["distance"] == 40000
+        assert sent["icu_training_load"] == 75
+        for friendly in ("event_type", "duration_seconds", "distance_meters", "training_load"):
+            assert friendly not in sent
+
+    async def test_race_accepts_event_type_alias(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {
+                        "id": 3002,
+                        "name": "Race",
+                        "start_date_local": "2026-03-20",
+                        "category": "RACE_A",
+                        "type": "Ride",
+                    }
+                ],
+            )
+        )
+        result = await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-03-20",
+                        "name": "Race",
+                        "category": "RACE_A",
+                        "event_type": "Ride",
+                    }
+                ]
+            ),
+            ctx=mock_ctx,
+        )
+        # event_type must satisfy the RACE `type`-required validation.
+        assert "error" not in json.loads(result)
+
+
+class TestSwimLoadHint:
+    """Swim WORKOUTs that parse but get no load surface a swim-specific hint."""
+
+    async def test_swim_no_load_gets_hint(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 4001,
+                    "name": "Swim",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "type": "Swim",
+                    "description": "Main\n- 200mtr\n- 200mtr",
+                    "workout_doc": {"steps": [{"duration": 72}, {"duration": 72}]},
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Swim",
+            category="WORKOUT",
+            event_type="Swim",
+            description="Main\n- 200mtr\n- 200mtr",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert data["workout_parsed"] is True
+        assert "workout_load_hint" in data
+        assert "CSS" in data["workout_load_hint"]
+
+    async def test_swim_with_load_no_hint(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 4002,
+                    "name": "Swim",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "type": "Swim",
+                    "description": "Main\n- 200mtr Z2 HR",
+                    "workout_doc": {"steps": [{"duration": 72, "hr": {"value": 75}}]},
+                    "icu_training_load": 5,
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Swim",
+            category="WORKOUT",
+            event_type="Swim",
+            description="Main\n- 200mtr Z2 HR",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert "workout_load_hint" not in data
+
+    async def test_nonswim_no_load_gets_no_swim_hint(self, mock_config, respx_mock):
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 4003,
+                    "name": "Run",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "type": "Run",
+                    "description": "Main\n- 40m Z2",
+                    "workout_doc": {"steps": [{"duration": 2400}]},
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Run",
+            category="WORKOUT",
+            event_type="Run",
+            description="Main\n- 40m Z2",
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert "workout_load_hint" not in data
+
+    async def test_swim_untargeted_work_gets_hint_despite_stray_load(self, mock_config, respx_mock):
+        # Real case: work reps carry no target (model wrote "- 200mtr CSS"), the
+        # warmup has a pace zone, and a stray load of 1 slips in. The hint must
+        # still fire because the *work* steps have no intensity.
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+        desc = (
+            "Warmup\n- 400mtr Z2 Pace\n\nMain 5x\n- 200mtr CSS\n- 20s rest\n\nCooldown\n- 200mtr Z1"
+        )
+        respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": 4004,
+                    "name": "Swim",
+                    "start_date_local": "2026-03-20",
+                    "category": "WORKOUT",
+                    "type": "Swim",
+                    "description": desc,
+                    "workout_doc": {
+                        "steps": [
+                            {
+                                "duration": 12,
+                                "distance": 400,
+                                "warmup": True,
+                                "pace": {"value": 2, "units": "pace_zone"},
+                            },
+                            {
+                                "reps": 5,
+                                "steps": [
+                                    {"duration": 6, "distance": 200},
+                                    {"duration": 20},
+                                ],
+                            },
+                            {
+                                "duration": 6,
+                                "distance": 200,
+                                "cooldown": True,
+                                "power": {"value": 1, "units": "%ftp"},
+                            },
+                        ]
+                    },
+                    "icu_training_load": 1,
+                },
+            )
+        )
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Swim",
+            category="WORKOUT",
+            event_type="Swim",
+            description=desc,
+            ctx=mock_ctx,
+        )
+        data = json.loads(result)["data"]
+        assert data["workout_parsed"] is True
+        assert "workout_load_hint" in data
+
+    def test_repeated_warmup_cooldown_does_not_mask_untargeted_work(self):
+        # Live-verified doc shape: a repeated "Warmup 4x" / "COOLDOWN 2x" block is
+        # never flagged warmup/cooldown — the header survives only in the block's
+        # `text` — so its pace-targeted reps must not mask an untargeted main set.
+        steps = [
+            {
+                "reps": 4,
+                "text": "Warmup 4x",
+                "steps": [
+                    {"pace": {"units": "pace_zone", "value": 2}, "distance": 100},
+                    {"duration": 20},
+                ],
+            },
+            {"distance": 800, "duration": 2324},  # main set, no target
+            {
+                "reps": 2,
+                "text": "COOLDOWN 2x",  # header match is case-insensitive
+                "steps": [
+                    {"pace": {"units": "pace_zone", "value": 2}, "distance": 100},
+                    {"duration": 20},
+                ],
+            },
+        ]
+        assert _swim_work_lacks_intensity(steps) is True
+        # Only excluded blocks left -> no work steps to judge -> no hint.
+        assert _swim_work_lacks_intensity([steps[0], steps[2]]) is False
+
+    def test_intensity_attribute_flags_excluded_inside_repeats(self):
+        # `intensity=warmup` on a step sets the same `warmup` flag a header does —
+        # live-verified, including on children inside a repeat block — so an
+        # attribute-tagged warmup drill can't mask an untargeted main set either,
+        # even when the section name ("Drills 4x") matches no header keyword.
+        steps = [
+            {
+                "reps": 4,
+                "text": "Drills 4x",
+                "steps": [
+                    {
+                        "pace": {"units": "pace_zone", "value": 2},
+                        "warmup": True,
+                        "distance": 100,
+                        "intensity": "warmup",
+                    },
+                    {"duration": 20, "intensity": "rest"},
+                ],
+            },
+            {"distance": 800, "duration": 2324},  # main set, no target
+        ]
+        assert _swim_work_lacks_intensity(steps) is True
+
+    def test_targeted_repeat_main_set_counts_as_work(self):
+        # A repeat block under a plain section name stays work: its pace target
+        # means the hint must not fire.
+        steps = [
+            {
+                "reps": 5,
+                "text": "Main 5x",
+                "steps": [
+                    {"pace": {"units": "pace_zone", "value": 3}, "distance": 200},
+                    {"duration": 20},
+                ],
+            },
+        ]
+        assert _swim_work_lacks_intensity(steps) is False
+
+
+class TestEventTags:
+    """Tags round-trip through create/update/bulk and back in responses (#16)."""
+
+    @staticmethod
+    def _ctx(mock_config):
+        ctx = MagicMock()
+        ctx.get_state = AsyncMock(return_value=mock_config)
+        return ctx
+
+    @staticmethod
+    def _event_json(**extra):
+        return {
+            "id": 1001,
+            "name": "Sweet Spot",
+            "start_date_local": "2026-03-20",
+            "category": "WORKOUT",
+            **extra,
+        }
+
+    async def test_create_event_sends_and_returns_tags(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(200, json=self._event_json(tags=["sweet-spot", "indoor"]))
+        )
+
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Sweet Spot",
+            category="WORKOUT",
+            tags=["sweet-spot", "indoor"],
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["tags"] == ["sweet-spot", "indoor"]
+        assert json.loads(result)["data"]["tags"] == ["sweet-spot", "indoor"]
+
+    async def test_create_event_omits_tags_when_not_provided(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(200, json=self._event_json())
+        )
+
+        result = await create_event(
+            start_date="2026-03-20",
+            name="Sweet Spot",
+            category="WORKOUT",
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert "tags" not in sent
+        assert "tags" not in json.loads(result)["data"]
+
+    async def test_update_event_tags_alone_is_a_valid_update(self, mock_config, respx_mock):
+        route = respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json=self._event_json(tags=["vo2max"]))
+        )
+
+        result = await update_event(event_id=1001, tags=["vo2max"], ctx=self._ctx(mock_config))
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent == {"tags": ["vo2max"]}
+        assert json.loads(result)["data"]["tags"] == ["vo2max"]
+
+    async def test_update_event_empty_list_is_sent_to_clear_tags(self, mock_config, respx_mock):
+        route = respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json=self._event_json(tags=[]))
+        )
+
+        result = await update_event(event_id=1001, tags=[], ctx=self._ctx(mock_config))
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent == {"tags": []}
+        assert "tags" not in json.loads(result)["data"]
+
+    async def test_update_event_omits_tags_when_not_provided(self, mock_config, respx_mock):
+        route = respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json=self._event_json())
+        )
+
+        await update_event(event_id=1001, name="Sweet Spot", ctx=self._ctx(mock_config))
+
+        sent = json.loads(route.calls.last.request.content)
+        assert "tags" not in sent
+
+    async def test_bulk_create_events_passes_tags_through(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(200, json=[self._event_json(tags=["sweet-spot"])])
+        )
+
+        result = await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-03-20",
+                        "name": "Sweet Spot",
+                        "category": "WORKOUT",
+                        "tags": ["sweet-spot"],
+                    }
+                ]
+            ),
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent[0]["tags"] == ["sweet-spot"]
+        assert json.loads(result)["data"]["events"][0]["tags"] == ["sweet-spot"]
+
+
+class TestEventAccessFlags:
+    """hide_from_athlete / athlete_cannot_edit on create, update, bulk create (#142)."""
+
+    @staticmethod
+    def _ctx(mock_config):
+        ctx = MagicMock()
+        ctx.get_state = AsyncMock(return_value=mock_config)
+        return ctx
+
+    @staticmethod
+    def _event_json(**extra):
+        return {
+            "id": 1001,
+            "name": "Threshold",
+            "start_date_local": "2026-10-12T00:00:00",
+            "category": "WORKOUT",
+            "hide_from_athlete": False,
+            "athlete_cannot_edit": False,
+            **extra,
+        }
+
+    async def test_create_event_sends_flags_and_returns_them(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(
+                200, json=self._event_json(hide_from_athlete=True, athlete_cannot_edit=True)
+            )
+        )
+
+        result = await create_event(
+            start_date="2026-10-12",
+            name="Threshold",
+            category="WORKOUT",
+            hide_from_athlete=True,
+            athlete_cannot_edit=True,
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["hide_from_athlete"] is True
+        assert sent["athlete_cannot_edit"] is True
+        data = json.loads(result)["data"]
+        assert data["hide_from_athlete"] is True
+        assert data["athlete_cannot_edit"] is True
+
+    async def test_create_event_omits_flags_when_not_passed(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events").mock(
+            return_value=Response(200, json=self._event_json())
+        )
+
+        await create_event(
+            start_date="2026-10-12",
+            name="Threshold",
+            category="WORKOUT",
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert "hide_from_athlete" not in sent
+        assert "athlete_cannot_edit" not in sent
+
+    async def test_update_event_single_flag_is_a_valid_update(self, mock_config, respx_mock):
+        route = respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json=self._event_json(hide_from_athlete=True))
+        )
+
+        result = await update_event(
+            event_id=1001, hide_from_athlete=True, ctx=self._ctx(mock_config)
+        )
+
+        assert json.loads(route.calls.last.request.content) == {"hide_from_athlete": True}
+        assert json.loads(result)["data"]["hide_from_athlete"] is True
+
+    async def test_update_event_sends_false_to_reveal(self, mock_config, respx_mock):
+        route = respx_mock.put("/athlete/i123456/events/1001").mock(
+            return_value=Response(200, json=self._event_json())
+        )
+
+        await update_event(event_id=1001, hide_from_athlete=False, ctx=self._ctx(mock_config))
+
+        assert json.loads(route.calls.last.request.content) == {"hide_from_athlete": False}
+
+    async def test_bulk_create_passes_flags_through(self, mock_config, respx_mock):
+        route = respx_mock.post("/athlete/i123456/events/bulk").mock(
+            return_value=Response(200, json=[self._event_json(hide_from_athlete=True)])
+        )
+
+        await bulk_create_events(
+            events=json.dumps(
+                [
+                    {
+                        "start_date_local": "2026-10-12",
+                        "name": "Threshold",
+                        "category": "WORKOUT",
+                        "hide_from_athlete": True,
+                    }
+                ]
+            ),
+            ctx=self._ctx(mock_config),
+        )
+
+        sent = json.loads(route.calls.last.request.content)
+        assert sent[0]["hide_from_athlete"] is True
+
+
+class TestBulkUpdateEventAccess:
+    """icu_bulk_update_event_access: WORKOUT-only, partial, per-event results (#142)."""
+
+    @staticmethod
+    def _ctx(mock_config):
+        ctx = MagicMock()
+        ctx.get_state = AsyncMock(return_value=mock_config)
+        return ctx
+
+    @staticmethod
+    def _ev(event_id: int, category: str = "WORKOUT", **extra):
+        return {
+            "id": event_id,
+            "name": f"Event {event_id}",
+            "start_date_local": "2026-10-12T00:00:00",
+            "category": category,
+            "hide_from_athlete": False,
+            "athlete_cannot_edit": False,
+            **extra,
+        }
+
+    def _mock_put(self, respx_mock, event_id: int, **flags):
+        return respx_mock.put(f"/athlete/i123456/events/{event_id}").mock(
+            return_value=Response(200, json=self._ev(event_id, **flags))
+        )
+
+    async def test_range_updates_workouts_and_skips_other_categories(
+        self, mock_config, respx_mock
+    ):
+        list_route = respx_mock.get("/athlete/i123456/events").mock(
+            return_value=Response(
+                200,
+                json=[self._ev(1), self._ev(2, "NOTE"), self._ev(3, "RACE_A"), self._ev(4)],
+            )
+        )
+        put1 = self._mock_put(respx_mock, 1, hide_from_athlete=True)
+        put4 = self._mock_put(respx_mock, 4, hide_from_athlete=True)
+        put_note = self._mock_put(respx_mock, 2)
+        put_race = self._mock_put(respx_mock, 3)
+
+        result = await bulk_update_event_access(
+            oldest="2026-10-05",
+            newest="2026-10-25",
+            hide_from_athlete=True,
+            ctx=self._ctx(mock_config),
+        )
+
+        params = list_route.calls.last.request.url.params
+        assert params["oldest"] == "2026-10-05"
+        assert params["newest"] == "2026-10-25"
+        assert json.loads(put1.calls.last.request.content) == {"hide_from_athlete": True}
+        assert put4.called
+        assert not put_note.called
+        assert not put_race.called
+
+        data = json.loads(result)["data"]
+        assert [u["id"] for u in data["updated"]] == [1, 4]
+        assert data["updated"][0]["hide_from_athlete"] is True
+        assert {s["id"]: s["category"] for s in data["skipped"]} == {2: "NOTE", 3: "RACE_A"}
+        assert data["skipped"][0]["reason"] == "not_workout"
+        assert data["failed_count"] == 0
+
+    async def test_ids_mode_skips_non_workouts(self, mock_config, respx_mock):
+        respx_mock.get("/athlete/i123456/events/1").mock(
+            return_value=Response(200, json=self._ev(1))
+        )
+        respx_mock.get("/athlete/i123456/events/2").mock(
+            return_value=Response(200, json=self._ev(2, "TARGET"))
+        )
+        put1 = self._mock_put(respx_mock, 1, athlete_cannot_edit=True)
+        put2 = self._mock_put(respx_mock, 2)
+
+        result = await bulk_update_event_access(
+            event_ids="[1, 2]", athlete_cannot_edit=True, ctx=self._ctx(mock_config)
+        )
+
+        assert json.loads(put1.calls.last.request.content) == {"athlete_cannot_edit": True}
+        assert not put2.called
+        data = json.loads(result)["data"]
+        assert data["updated_count"] == 1
+        assert data["skipped"][0]["category"] == "TARGET"
+
+    async def test_duplicate_ids_are_fetched_and_updated_once(self, mock_config, respx_mock):
+        get1 = respx_mock.get("/athlete/i123456/events/1").mock(
+            return_value=Response(200, json=self._ev(1))
+        )
+        put1 = self._mock_put(respx_mock, 1, hide_from_athlete=True)
+
+        result = await bulk_update_event_access(
+            event_ids="[1, 1, 1]", hide_from_athlete=True, ctx=self._ctx(mock_config)
+        )
+
+        assert get1.call_count == 1
+        assert put1.call_count == 1
+        assert json.loads(result)["data"]["updated_count"] == 1
+
+    async def test_already_set_events_are_unchanged_without_a_put(
+        self, mock_config, respx_mock
+    ):
+        respx_mock.get("/athlete/i123456/events").mock(
+            return_value=Response(
+                200, json=[self._ev(1, hide_from_athlete=True, athlete_cannot_edit=True)]
+            )
+        )
+        put1 = self._mock_put(respx_mock, 1)
+
+        result = await bulk_update_event_access(
+            oldest="2026-10-12",
+            newest="2026-10-12",
+            hide_from_athlete=True,
+            athlete_cannot_edit=True,
+            ctx=self._ctx(mock_config),
+        )
+
+        assert not put1.called
+        data = json.loads(result)["data"]
+        assert data["unchanged"] == [1]
+        assert data["updated_count"] == 0
+
+    async def test_one_missing_id_fails_and_the_rest_still_update(
+        self, mock_config, respx_mock
+    ):
+        respx_mock.get("/athlete/i123456/events/1").mock(
+            return_value=Response(200, json=self._ev(1))
+        )
+        respx_mock.get("/athlete/i123456/events/99").mock(
+            return_value=Response(404, json={"error": "Not found"})
+        )
+        put1 = self._mock_put(respx_mock, 1, hide_from_athlete=True)
+
+        result = await bulk_update_event_access(
+            event_ids="[1, 99]", hide_from_athlete=True, ctx=self._ctx(mock_config)
+        )
+
+        assert put1.called
+        data = json.loads(result)["data"]
+        assert data["updated_count"] == 1
+        assert [f["id"] for f in data["failed"]] == [99]
+
+    async def test_failed_put_is_reported_per_event(self, mock_config, respx_mock):
+        respx_mock.get("/athlete/i123456/events").mock(
+            return_value=Response(200, json=[self._ev(1), self._ev(2)])
+        )
+        self._mock_put(respx_mock, 1, hide_from_athlete=True)
+        respx_mock.put("/athlete/i123456/events/2").mock(
+            return_value=Response(403, json={"error": "Forbidden"})
+        )
+
+        result = await bulk_update_event_access(
+            oldest="2026-10-12",
+            newest="2026-10-12",
+            hide_from_athlete=True,
+            ctx=self._ctx(mock_config),
+        )
+
+        data = json.loads(result)["data"]
+        assert [u["id"] for u in data["updated"]] == [1]
+        assert [f["id"] for f in data["failed"]] == [2]
+
+    async def test_empty_range_is_not_an_error(self, mock_config, respx_mock):
+        respx_mock.get("/athlete/i123456/events").mock(return_value=Response(200, json=[]))
+
+        result = await bulk_update_event_access(
+            oldest="2026-10-12",
+            newest="2026-10-18",
+            hide_from_athlete=False,
+            ctx=self._ctx(mock_config),
+        )
+
+        response = json.loads(result)
+        assert "error" not in response
+        assert response["data"]["updated_count"] == 0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"hide_from_athlete": True}, "Select events"),
+            ({"event_ids": "[1]"}, "Pass hide_from_athlete"),
+            (
+                {"event_ids": "[1]", "oldest": "2026-10-12", "newest": "2026-10-12",
+                 "hide_from_athlete": True},
+                "not both",
+            ),
+            ({"oldest": "2026-10-12", "hide_from_athlete": True}, "both oldest and newest"),
+            (
+                {"oldest": "12.10.2026", "newest": "2026-10-18", "hide_from_athlete": True},
+                "Invalid date",
+            ),
+            (
+                {"oldest": "2026-10-18", "newest": "2026-10-12", "hide_from_athlete": True},
+                "on or before",
+            ),
+            ({"event_ids": '["a"]', "hide_from_athlete": True}, "JSON array of integers"),
+            ({"event_ids": "[]", "hide_from_athlete": True}, "JSON array of integers"),
+            ({"event_ids": "not json", "hide_from_athlete": True}, "JSON array of integers"),
+        ],
+    )
+    async def test_validation_errors(self, mock_config, respx_mock, kwargs, message):
+        result = await bulk_update_event_access(ctx=self._ctx(mock_config), **kwargs)
+
+        response = json.loads(result)
+        assert response["error"]["type"] == "validation_error"
+        assert message in response["error"]["message"]

@@ -25,7 +25,8 @@ Resolved via clarifying questions before this spec was written:
 
 | Question | Decision |
 | --- | --- |
-| How to pull in upstream intervals-icu-mcp | Git submodule, tool modules imported/merged into **one process**, behind our own abstraction layer (§03) |
+| How to pull in upstream intervals-icu-mcp | **Plain vendored copy** (not a git submodule — see §03 revision below), tool modules imported/merged into **one process**, behind our own abstraction layer |
+| How end users deploy this | **Zero command line.** Fly.io's dashboard "Deploy from GitHub" flow (paste the repo URL, click through, add secrets in the Secrets tab) — no `flyctl`, no `git`, no terminal for the person running this. This is why the submodule decision above was revisited (§03). |
 | Shape of persisted trainer memory | Named key/value docs, same five `state_*` tools as datastore-mcp, now S3-backed |
 | Single vs multi-athlete | Single user/athlete, same as both existing MCPs |
 | Deployment topology | One Fly.io app, one always-on machine |
@@ -70,8 +71,12 @@ Checked and confirmed: FastMCP ships `OAuthProxy`, `RemoteAuthProvider`, and pro
 
 ## 03 Upstream integration & abstraction layer
 
-- `git submodule add https://github.com/hhopke/intervals-icu-mcp vendor/intervals-icu-mcp`
-- Our `pyproject.toml` depends on it as a local/editable path dependency (uv workspace member, or `pip install -e vendor/intervals-icu-mcp`), so `import intervals_icu_mcp` resolves to the vendored tree unmodified. **Nothing in `vendor/` is ever hand-edited** — it is updated only by bumping the submodule pointer.
+**Revised from the original plan.** A git submodule was the first choice here, specifically to make upstream updates a one-line pointer bump. It was dropped once a deployment requirement took priority: **the person deploying this must never need a command line** — they create a Fly.io account, point Fly at this GitHub repo, add secrets by clicking in Fly's dashboard, and that's it (§09). Fly's "Deploy from GitHub" flow clones the repository the way GitHub itself would hand it to anyone — there is no guarantee it runs `git submodule update --init`, and if it silently doesn't, the vendored code is just missing at build time with no CLI available to the end user to fix it. A plain, fully-committed copy removes that failure mode entirely, for every build path (Fly's dashboard, a GitHub Actions workflow, a local `docker build`) at once.
+
+- Upstream's source tree (everything except its own `.git` directory) is copied as-is into `vendor/intervals-icu-mcp/` and committed as ordinary tracked files.
+- Our `pyproject.toml` depends on it as a local/editable path dependency (`[tool.uv.sources]` pointing at `vendor/intervals-icu-mcp`), so `import intervals_icu_mcp` resolves to the vendored tree unmodified — same import-time behavior as a submodule would have given us.
+- One build-compatibility change is applied to the vendored copy's own `pyproject.toml`: `fallback-version = "0.0.0"` added under `[tool.hatch.version]`, because upstream derives its package version from git history (`hatch-vcs`), which no longer exists once `.git` is stripped. This is a standard, documented hatch-vcs option for exactly this situation — not a code change.
+- **Nothing else in `vendor/` is ever hand-edited.** "Updating upstream" now means: download the latest upstream source, replace the `vendor/intervals-icu-mcp/` directory wholesale, re-apply the one `fallback-version` line, run the regression suite (§04), and commit. This is a manual step for whoever maintains this repository — not something the deploying end user ever does or needs tooling for.
 
 ### Why an abstraction layer, not a direct import everywhere
 
@@ -80,19 +85,18 @@ Importing `intervals_icu_mcp.tools.*` or mounting its FastMCP app directly, scat
 - All contact with the vendored package goes through **one module**, `src/intervals_icu_s3_mcp/upstream.py` (or a small package if it grows), which is the single place that knows upstream's actual import paths and tool-registration mechanics.
 - The rest of our code (OAuth wiring, our own `server.py` composition root, tests) only ever calls into `upstream.py` — e.g. `upstream.register_tools(mcp)` or `upstream.get_mounted_app()` — never `intervals_icu_mcp.tools.activities` directly.
 - Registration mechanism, decided inside `upstream.py` — two candidate approaches, to be settled once the vendored code is actually in the tree and its `server.py` internals can be read:
-  - **Mount their FastMCP app into ours** (`mcp.mount(...)`), if upstream's `server.py` builds its own complete `FastMCP("intervals_icu_mcp")` instance with tools already registered — most update-resilient, since any new tool upstream adds shows up automatically on the next submodule bump, with zero code changes on our side.
-  - **Import and re-register tool functions individually** — more control (e.g. per-tool filtering later), but ties `upstream.py` to upstream's internal module layout; still fine, because that coupling is now confined to one file instead of spread across the codebase.
-  - Recommendation: try mounting first; fall back to per-module import only if mounting can't coexist cleanly with our own routes (notably `/health`, which both projects define — ours must win to avoid a path collision — `upstream.py` is also where that collision gets resolved).
-- **Updating upstream**: `git submodule update --remote vendor/intervals-icu-mcp`, commit the new pinned commit, push to `main`. This is what "centrally managed" and "updates automatically" mean in practice — a one-line bump touching one submodule pointer, immediately checked by the regression suite (§04) before it ever reaches production, not a live auto-upgrade of a running machine.
+  - **Mount their FastMCP app into ours** (`mcp.mount(...)`) — this is what's implemented (see `upstream.py`): upstream's `server.py` builds its own complete `FastMCP("intervals_icu_mcp")` instance with tools already registered, so any tool upstream adds or removes shows up automatically the next time `vendor/` is refreshed, with zero code changes on our side. Confirmed safe: mounting only composes tools/resources/prompts at the MCP protocol layer, not Starlette routes, so there is no collision with our own `/health` route.
+  - **Import and re-register tool functions individually** — the fallback, not used: more control (e.g. per-tool filtering later), but ties `upstream.py` to upstream's internal module layout.
+- **Updating upstream**: replace the `vendor/intervals-icu-mcp/` directory with a fresh copy of upstream's source, re-add the one `fallback-version` line (§03 above), run the regression suite (§04), commit, push to `main`. This is what "centrally managed" means in practice now — one directory swap plus one line, checked by CI before it ever reaches production, not a live auto-upgrade of a running machine, and not a submodule pointer bump.
 
 ## 04 Regression testing against upstream
 
-The abstraction layer (§03) tells us *where* upstream changes land; this suite tells us *whether* a given submodule bump broke anything, without waiting to find out in production.
+The abstraction layer (§03) tells us *where* upstream changes land; this suite tells us *whether* a given vendor refresh broke anything, without waiting to find out in production.
 
-- **Contract/smoke tests against the vendored package itself** (`tests/test_upstream_contract.py`): for every tool we rely on, assert it still exists under the expected import path / mount point, with the expected parameter names and return shape. These are *our* tests, living in our repo, run against whatever commit `vendor/` currently points to — not a copy of upstream's own test suite (which we don't maintain and which could drift from what we actually depend on).
-- **Integration tests against our `upstream.py` abstraction** (`tests/test_upstream_integration.py`): call `upstream.register_tools(mcp)` (or the mount equivalent) against a throwaway FastMCP instance and assert the full expected tool list appears, with no name collisions against our own `state_*` tools or `/health`.
-- **End-to-end smoke test** (`tests/test_e2e_smoke.py`): boot the combined app in-process (test client, no real network), run through OAuth (register → authorize → login → token), then call one representative upstream tool and one `state_*` tool over `/mcp`, asserting both succeed. This is the one test that would catch "upstream changed something and our mount silently stopped exposing tools."
-- **CI gate**: this suite runs on every push and PR, and explicitly on any commit that changes the `vendor/intervals-icu-mcp` submodule pointer — a submodule bump that fails these tests must not reach `main`/deploy. Mechanically: since Fly's GitHub integration deploys straight off `main` with no in-repo workflow (per the GitOps decision), the regression suite needs to run as a required GitHub Actions check gating the PR/merge to `main` itself — the gate sits *before* the push that triggers Fly's deploy, not as a separate deploy-time step.
+- **Contract/smoke tests against the vendored package itself** (`tests/test_upstream_contract.py`): for every tool we rely on, assert it still exists under the expected import path / mount point, with the expected parameter names and return shape. These are *our* tests, living in our repo, run against whatever copy currently sits in `vendor/` — not a copy of upstream's own test suite (which we don't maintain and which could drift from what we actually depend on).
+- **Integration tests against our `upstream.py` abstraction** (`tests/test_upstream_integration.py`): call `mount_upstream_tools(mcp)` against a throwaway FastMCP instance and assert the full expected tool list appears, with no name collisions against our own `state_*` tools or `/health`.
+- **End-to-end smoke test** (`tests/test_e2e_smoke.py`): boot the combined app in-process, list tools (confirming upstream tools are mounted) and call one `state_*` tool against a mocked S3 bucket, asserting it succeeds. This is the one test that would catch "upstream changed something and our mount silently stopped exposing tools."
+- **CI gate**: this suite runs on every push and PR, and explicitly on any commit that touches `vendor/` — a vendor refresh that fails these tests must not reach `main`/deploy. Mechanically: Fly's "Deploy from GitHub" dashboard flow deploys straight off `main`, so the regression suite runs as a required GitHub Actions check (`.github/workflows/test.yml`) gating the PR/merge to `main` itself — the gate sits *before* the push that triggers Fly's deploy, not as a separate deploy-time step.
 - **Not in scope**: re-testing upstream's own internal correctness (e.g. whether their intervals.icu API client parses responses right) — that's upstream's job and its own CI. Ours only checks the *contract we depend on* didn't shift under us.
 
 ### Unit tests for our own functionality
@@ -147,8 +151,20 @@ Ported design, not ported code (different language): same self-issued OAuth 2.1 
 | Machine count | 1 (pinned, same rationale as datastore-mcp §06/§09) |
 | Size | TBD after first real boot — Python + FastMCP + httpx likely needs more than the Node app's 256MB; profile before fixing |
 | Scaling | `auto_stop_machines=false`, `min_machines_running=1` |
-| Storage | `fly storage create` provisions a Tigris bucket for this app |
-| CI/CD | Fly's GitHub integration, build & deploy on push to `main` — **contingent on submodule support, see Open items** — gated beforehand by the regression suite (§04) as a required check on `main` |
+| Storage | A Tigris bucket, created by clicking through Fly's dashboard (Object Storage), attached to this app |
+| CI/CD | **Fly's "Deploy from GitHub" dashboard flow** — the end user pastes this repo's URL once, Fly builds the Dockerfile and sets up continuous deployment, no CLI involved for them (§09, §13). The regression suite (§04) runs as a required GitHub Actions check, gating what reaches `main` before Fly ever builds it — that gate is for maintainers pushing changes, not for the end user deploying their own copy. |
+
+### Zero-CLI deployment flow
+
+The person running their own copy of this server never installs or types anything in a terminal. The full path, detailed with screenshots-level precision in [README.md](README.md):
+
+1. Create a Fly.io account (web signup).
+2. On Fly's dashboard, "Deploy from GitHub" — paste/select this repository, Fly builds the committed `Dockerfile` and sets up continuous deployment (future pushes to `main` auto-redeploy).
+3. Create a Tigris bucket by clicking through Fly's Object Storage dashboard page, attached to the new app.
+4. Add the remaining secrets (`PUBLIC_URL`, `OAUTH_USERNAME`, `OAUTH_PASSWORD`, `INTERVALS_ICU_API_KEY`, `INTERVALS_ICU_ATHLETE_ID`, `INTERVALS_ICU_DELETE_MODE`) by clicking "New secret" in the app's Secrets tab.
+5. Redeploy (a button click) so the app picks up the secrets, then connect from Claude.ai's Connectors settings.
+
+This is the deployment requirement that drove the §03 revision away from a git submodule.
 
 ## 10 Trade-offs & limitations
 
@@ -160,18 +176,17 @@ Carried over from datastore-mcp, plus new ones specific to this project:
 - Open dynamic client registration — the login screen is the real boundary, not `/register`.
 - `state_delete` is soft-only, as in datastore-mcp.
 - S3 has no transactional create-if-absent (§06) — a documented race-condition risk, not fixed.
-- "Automatic updates" from upstream means a submodule-bump-and-redeploy, checked by the regression suite, not live auto-upgrade (§03, §04).
+- "Automatic updates" from upstream means a manual vendor-directory refresh, checked by the regression suite, then a normal push (§03, §04) — not a live auto-upgrade, and no longer a one-line submodule bump either, traded away deliberately for a zero-CLI end-user deploy (§03, §13).
 - The abstraction layer and regression suite catch *contract* breaks (renamed/removed/reshaped tools); they do not catch upstream behavioral changes that keep the same signature but change what the tool actually does — that class of change still needs a human skim of upstream's changelog on each bump.
 - Exposing 100% of upstream's write-capable tools means anything that can reach this MCP can mutate the athlete's real intervals.icu data (delete activities, change FTP/sport settings, etc.) — a deliberate choice, flagged here for visibility since it's a meaningfully bigger blast radius than a read-only connector.
 
-## 11 Open items to resolve during implementation
+## 11 Open items
 
-1. **Submodule support in Fly's GitHub integration** — unverified. Fly's native builder may not run `git submodule update --init` on checkout. Test early; if it doesn't work, fall back to an explicit GitHub Actions workflow (`actions/checkout` with `submodules: recursive`, then `flyctl deploy`) as Plan B — this is the one place the "no in-repo workflow" decision might have to flip, and it would also become the natural home for the regression-suite CI gate (§04).
-2. **Tool-registration mechanism inside `upstream.py`** (§03) — mount upstream's FastMCP app wholesale vs. import/re-register tool-by-tool. Decide once the vendored code is actually in the tree.
-3. **Exact S3/Tigris env var names** `fly storage create` injects (AWS_* standard names vs. custom), and any Tigris-specific quirks (e.g. region value, conditional-write support) — confirm at provisioning time.
-4. **Repo and Fly app naming.**
-5. **Machine size** — pick after profiling the Python process's actual memory footprint under load.
-6. **Regression suite scope at launch** — start with the contract/integration/e2e-smoke tests in §04; decide later whether to also pin and test against upstream's own `tests/smoke_eval.json` fixtures for extra coverage.
+1. ~~Submodule support in Fly's GitHub integration~~ — resolved by dropping the submodule entirely (§03); no longer applicable.
+2. **Exact behavior of Fly's dashboard "attach bucket to app" step** — expected to auto-inject `BUCKET_NAME`/`AWS_*` secrets the same way `fly storage create` would from the CLI, but unverified against the current dashboard UI. If it doesn't, the bucket detail page shows the same values to copy into the Secrets tab by hand — README covers both paths.
+3. **Machine size** — pick after profiling the Python process's actual memory footprint under load.
+4. **Regression suite scope at launch** — start with the contract/integration/e2e-smoke tests in §04; decide later whether to also pin and test against upstream's own `tests/smoke_eval.json` fixtures for extra coverage.
+5. **Keeping the vendored copy current** — no automated staleness check exists yet; relies on a maintainer periodically re-vendoring (§03). Worth a reminder/cadence once this is in real use.
 
 ## 12 Proposed repository layout
 
@@ -190,10 +205,11 @@ tests/
   test_upstream_contract.py     # §04 — tool existence/shape vs. vendored package
   test_upstream_integration.py  # §04 — registration via upstream.py, no collisions
   test_e2e_smoke.py             # §04 — full OAuth + one upstream tool + one state_* tool, in-process
-vendor/intervals-icu-mcp/   # git submodule, untouched
+vendor/intervals-icu-mcp/   # plain vendored copy (not a submodule, see §03), untouched except one fallback-version line
 Dockerfile
 fly.toml
+README.md            # zero-CLI setup guide for the person deploying this
 ```
 
 ---
-intervals-icu-s3-mcp — draft specification, not yet implemented
+intervals-icu-s3-mcp — implemented; see README.md to deploy, this document for the design

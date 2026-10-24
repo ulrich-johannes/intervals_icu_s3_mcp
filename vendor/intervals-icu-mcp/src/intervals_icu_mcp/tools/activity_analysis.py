@@ -1,0 +1,675 @@
+"""Activity analysis tools for Intervals.icu MCP server."""
+
+import math
+from itertools import zip_longest
+from typing import Annotated, Any, cast
+
+from fastmcp import Context
+
+from ..auth import ICUConfig
+from ..client import ICUAPIError, ICUClient
+from ..response_builder import ResponseBuilder
+from ._strava import fetch_strava_limitation_note
+
+
+async def get_activity_streams(
+    activity_id: Annotated[str, "Activity ID to fetch streams for"],
+    streams: Annotated[
+        list[str] | None,
+        "List of stream types (e.g., ['watts', 'heartrate', 'cadence']). If not specified, the activity's default streams are fetched — which does NOT include raw_heartrate or fixed_heartrate; ask for those by name.",
+    ] = None,
+    max_points: Annotated[
+        int | None,
+        "Thin every returned stream to at most this many samples by keeping every Nth one (the same N for all streams, so indices stay aligned). Omit for full resolution. ~500 is plenty to trace a route or see the shape of a ride. Samples are not always 1 s apart, so include 'time' to know when each kept sample was recorded.",
+    ] = None,
+    ctx: Context | None = None,
+) -> str:
+    """Fetch RAW per-sample time-series of one activity — second-by-second arrays for power, HR, cadence, speed, altitude, GPS, temperature, grade, etc.
+
+    Heavy payload. Use only when you need the underlying signal for
+    visualization or custom analysis. Most "how was my ride?" questions
+    are better answered by get_activity_details (summary metrics) or
+    get_activity_intervals (per-lap breakdown).
+
+    Stream-type filter accepts any of: watts, heartrate, cadence,
+    velocity_smooth, altitude, distance, time, latlng, temp, moving,
+    grade_smooth, raw_heartrate, fixed_heartrate.
+
+    `latlng` comes back as [lat, lng] pairs (null where the sample has no
+    GPS fix).
+
+    `left_right_balance` (dual-sided power meters) is the RIGHT pedal's share
+    of power in percent (FIT convention), not the left's: a stream averaging
+    48 means L 52% / R 48%. The response adds a `stream_notes` entry saying so whenever the
+    stream is returned.
+
+    `heartrate` is CORRECTED data: Intervals.icu replaces readings above the
+    athlete's configured max HR with an interpolated line at import, so it can
+    never exceed that setting. `raw_heartrate` is the uncorrected trace and is
+    the only way to see a genuine new max that was clipped away — the platform
+    never raises the setting on its own. Request it explicitly; it is not in
+    the default set.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    if max_points is not None and max_points < 1:
+        return ResponseBuilder.build_error_response(
+            "max_points must be at least 1", error_type="validation_error"
+        )
+
+    try:
+        async with ICUClient(config) as client:
+            stream_list = await client.get_activity_streams(activity_id, streams)
+
+            if not stream_list:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"streams": {}, "available_streams": []},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No stream data available for this activity"},
+                )
+
+            # Build response from list of ActivityStream objects
+            available_streams: list[str] = []
+            streams_dict: dict[str, Any] = {}
+
+            for s in stream_list:
+                name = s.type or s.name or "unknown"
+                available_streams.append(name)
+                data: Any = s.data
+                data2: Any = s.data2
+                if data is None:
+                    continue
+                # latlng carries latitude in `data` and longitude in `data2`.
+                # Paired for any stream with a data2 array so none of it is dropped;
+                # zip_longest pads a length mismatch with None instead of truncating.
+                if isinstance(data, list) and isinstance(data2, list) and data2:
+                    lats = cast(list[Any], data)
+                    lngs = cast(list[Any], data2)
+                    streams_dict[name] = [
+                        None if lat is None and lng is None else [lat, lng]
+                        for lat, lng in zip_longest(lats, lngs)
+                    ]
+                else:
+                    streams_dict[name] = data
+
+            full_length = max(
+                (len(d) for d in streams_dict.values() if isinstance(d, list)),  # type: ignore[arg-type]
+                default=0,
+            )
+            step = 1
+            if max_points is not None and full_length > max_points:
+                # Same step for every stream keeps index i aligned across streams
+                step = math.ceil(full_length / max_points)
+                for name, d in streams_dict.items():
+                    if isinstance(d, list):
+                        streams_dict[name] = d[::step]
+
+            stream_lengths = {
+                name: len(d)  # type: ignore[arg-type]
+                for name, d in streams_dict.items()
+                if isinstance(d, list)
+            }
+
+            result_data: dict[str, Any] = {
+                "activity_id": activity_id,
+                "streams": streams_dict,
+                "available_streams": available_streams,
+                "stream_lengths": stream_lengths,
+            }
+            if "left_right_balance" in streams_dict:
+                result_data["stream_notes"] = {
+                    "left_right_balance": (
+                        "Percent of power from the RIGHT pedal (FIT convention; consistent "
+                        "with a reported average of 48 showing as L 52% / R 48% in the "
+                        "Intervals.icu UI). Left = 100 - value. Cross-check against the "
+                        "activity's average L/R if the side matters."
+                    )
+                }
+            if step > 1:
+                result_data["downsampling"] = {
+                    "step": step,
+                    "original_length": full_length,
+                    "note": f"Index i here is original sample i*{step}.",
+                }
+
+            return ResponseBuilder.build_response(
+                data=result_data,
+                query_type="activity_streams",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_activity_intervals(
+    activity_id: Annotated[str, "Activity ID to fetch intervals for"],
+    ctx: Context | None = None,
+) -> str:
+    """Fetch the per-LAP / per-interval breakdown of one activity — each segment with its target, actual power/HR/pace, and type (warm-up / work / rest / cool-down).
+
+    Use for workout-compliance analysis, lap-by-lap review,
+    "did I hit my intervals?". For headline summary metrics use
+    get_activity_details; for raw second-by-second data use
+    get_activity_streams.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            intervals = await client.get_activity_intervals(activity_id)
+
+            if not intervals:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"intervals": [], "count": 0, "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No intervals found for this activity"},
+                )
+
+            intervals_data: list[dict[str, Any]] = []
+            for interval in intervals:
+                interval_item: dict[str, Any] = {
+                    "id": interval.id,
+                    "type": interval.type,
+                }
+
+                if interval.start is not None:
+                    interval_item["start_seconds"] = interval.start
+                if interval.end is not None:
+                    interval_item["end_seconds"] = interval.end
+                if interval.duration is not None:
+                    interval_item["duration_seconds"] = interval.duration
+
+                # Performance metrics
+                performance: dict[str, Any] = {}
+                if interval.average_watts:
+                    performance["average_watts"] = interval.average_watts
+                if interval.normalized_power:
+                    performance["normalized_power"] = interval.normalized_power
+                if interval.average_heartrate:
+                    performance["average_heartrate"] = interval.average_heartrate
+                if interval.max_heartrate:
+                    performance["max_heartrate"] = interval.max_heartrate
+                if interval.average_cadence:
+                    performance["average_cadence"] = interval.average_cadence
+                if interval.average_speed:
+                    performance["average_speed_meters_per_sec"] = interval.average_speed
+                if interval.distance:
+                    performance["distance_meters"] = interval.distance
+
+                if performance:
+                    interval_item["performance"] = performance
+
+                # Target data
+                if interval.target:
+                    interval_item["target_description"] = interval.target
+                if interval.target_min is not None or interval.target_max is not None:
+                    interval_item["target_range"] = {
+                        "min": interval.target_min,
+                        "max": interval.target_max,
+                    }
+
+                intervals_data.append(interval_item)
+
+            # Calculate summary
+            work_intervals = [i for i in intervals if i.type and "WORK" in i.type.upper()]
+            rest_intervals = [i for i in intervals if i.type and "REST" in i.type.upper()]
+
+            summary = {
+                "total_intervals": len(intervals),
+                "work_intervals": len(work_intervals),
+                "rest_intervals": len(rest_intervals),
+            }
+
+            # Calculate total work time
+            if work_intervals:
+                total_work_time = sum(i.duration for i in work_intervals if i.duration)
+                if total_work_time:
+                    summary["total_work_time_seconds"] = total_work_time
+
+            result_data = {
+                "activity_id": activity_id,
+                "intervals": intervals_data,
+                "summary": summary,
+            }
+
+            return ResponseBuilder.build_response(
+                data=result_data,
+                query_type="activity_intervals",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_best_efforts(
+    activity_id: Annotated[str, "Activity ID to analyze"],
+    stream: Annotated[
+        str, "Stream to search for best efforts: 'watts', 'heartrate', or 'pace'"
+    ] = "watts",
+    duration: Annotated[
+        int | None,
+        "Duration of each effort in seconds (e.g., 60 for 1-min, 1200 for 20-min). "
+        "At least one of 'duration' or 'distance' is required.",
+    ] = None,
+    distance: Annotated[
+        float | None,
+        "Distance of each effort in meters (e.g., 5000 for 5k). "
+        "At least one of 'duration' or 'distance' is required.",
+    ] = None,
+    count: Annotated[int, "Number of efforts to return (default 8)"] = 8,
+    ctx: Context | None = None,
+) -> str:
+    """Find the top-N peak efforts WITHIN a single activity for a given stream + target duration or distance.
+
+    Different from get_*_curves (which span many activities). Useful for
+    "what was my best 20-min power on this ride?" or "show my top 5k
+    splits in this run." Requires at least one of duration or distance.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    if duration is None and distance is None:
+        return ResponseBuilder.build_error_response(
+            "At least one of 'duration' or 'distance' is required",
+            error_type="validation_error",
+        )
+
+    try:
+        async with ICUClient(config) as client:
+            best_efforts = await client.get_best_efforts(
+                activity_id, stream=stream, duration=duration, distance=distance, count=count
+            )
+
+            if not best_efforts.efforts:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"best_efforts": [], "count": 0, "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No best efforts found for this activity"},
+                )
+
+            efforts_data: list[dict[str, Any]] = []
+            for effort in best_efforts.efforts:
+                effort_item: dict[str, Any] = {}
+                if effort.average is not None:
+                    effort_item["average"] = effort.average
+                if effort.duration is not None:
+                    effort_item["duration_seconds"] = effort.duration
+                if effort.distance is not None:
+                    effort_item["distance_meters"] = effort.distance
+                if effort.start_index is not None:
+                    effort_item["start_index"] = effort.start_index
+                if effort.end_index is not None:
+                    effort_item["end_index"] = effort.end_index
+                efforts_data.append(effort_item)
+
+            result_data = {
+                "activity_id": activity_id,
+                "stream": stream,
+                "best_efforts": efforts_data,
+                "count": len(efforts_data),
+            }
+
+            return ResponseBuilder.build_response(
+                data=result_data,
+                query_type="best_efforts",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+_INTERVAL_TARGET_TYPES = {"AUTO", "POWER", "HR", "PACE"}
+
+# The API returns full Activity objects (~180 fields each); only these carry
+# information about the interval match itself or identify the activity.
+_INTERVAL_SEARCH_FIELDS = [
+    "id",
+    "name",
+    "type",
+    "start_date_local",
+    "distance",
+    "moving_time",
+    "icu_training_load",
+    "interval_summary",
+]
+
+
+async def search_intervals(
+    interval_type: Annotated[
+        str | None,
+        "Interval target type: AUTO, POWER, HR, or PACE (what the interval "
+        "targeted — not the sport and not a workout-step label)",
+    ] = None,
+    min_duration: Annotated[int | None, "Minimum interval duration in seconds"] = None,
+    max_duration: Annotated[int | None, "Maximum interval duration in seconds"] = None,
+    min_intensity: Annotated[
+        int | None, "Minimum interval intensity in percent of threshold (e.g. 80)"
+    ] = None,
+    max_intensity: Annotated[
+        int | None, "Maximum interval intensity in percent of threshold (e.g. 105)"
+    ] = None,
+    limit: Annotated[int, "Maximum number of matching activities to return"] = 30,
+    athlete_id: Annotated[str | None, "Athlete ID (for coaches managing multiple athletes)"] = None,
+    ctx: Context | None = None,
+) -> str:
+    """Search intervals ACROSS ALL the athlete's activities (cross-activity).
+
+    Different from icu_get_activity_intervals (single-activity). Use to track
+    progress on a workout type ("all my threshold intervals over the last
+    year") or find comparable historical sessions. Returns the activities
+    containing matching intervals, each with an `interval_summary` like
+    "2x 8m 162w" (reps x duration at target).
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    if interval_type and interval_type.upper() not in _INTERVAL_TARGET_TYPES:
+        return ResponseBuilder.build_error_response(
+            f"Invalid interval_type '{interval_type}'. "
+            f"Must be one of: {', '.join(sorted(_INTERVAL_TARGET_TYPES))}.",
+            error_type="validation_error",
+        )
+
+    try:
+        async with ICUClient(config) as client:
+            results = await client.search_intervals(
+                athlete_id=athlete_id,
+                interval_type=interval_type.upper() if interval_type else None,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                min_intensity=min_intensity,
+                max_intensity=max_intensity,
+                limit=limit,
+            )
+
+            if not results:
+                search_criteria: list[str] = []
+                if interval_type:
+                    search_criteria.append(f"type={interval_type}")
+                if min_duration:
+                    search_criteria.append(f"min_duration={min_duration}s")
+                if max_duration:
+                    search_criteria.append(f"max_duration={max_duration}s")
+                if min_intensity:
+                    search_criteria.append(f"min_intensity={min_intensity}%")
+                if max_intensity:
+                    search_criteria.append(f"max_intensity={max_intensity}%")
+
+                criteria_str = ", ".join(search_criteria) if search_criteria else "your criteria"
+
+                return ResponseBuilder.build_response(
+                    data={"activities": [], "count": 0},
+                    metadata={"message": f"No intervals found matching {criteria_str}"},
+                )
+
+            activities = [
+                {k: item.get(k) for k in _INTERVAL_SEARCH_FIELDS if item.get(k) is not None}
+                for item in results
+            ]
+
+            result_data = {
+                "activities": activities,
+                "count": len(activities),
+                "search_criteria": {
+                    "interval_type": interval_type,
+                    "min_duration_seconds": min_duration,
+                    "max_duration_seconds": max_duration,
+                    "min_intensity_percent": min_intensity,
+                    "max_intensity_percent": max_intensity,
+                },
+            }
+
+            return ResponseBuilder.build_response(
+                data=result_data,
+                query_type="interval_search",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_power_histogram(
+    activity_id: Annotated[str, "Activity ID to analyze"],
+    ctx: Context | None = None,
+) -> str:
+    """Time-in-zone DISTRIBUTION of power within a single activity (histogram buckets, time per bucket).
+
+    Different from icu_get_power_curves (best efforts across many activities).
+    Use for "how was my workout intensity distributed?", training-zone
+    breakdown.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            buckets = await client.get_power_histogram(activity_id)
+
+            if not buckets:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"buckets": [], "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No power histogram data available for this activity"},
+                )
+
+            buckets_data: list[dict[str, Any]] = [
+                {
+                    "power_range": {
+                        "min_watts": int(b.min) if b.min is not None else None,
+                        "max_watts": int(b.max) if b.max is not None else None,
+                    },
+                    "time_seconds": b.secs or 0,
+                }
+                for b in buckets
+            ]
+
+            return ResponseBuilder.build_response(
+                data={
+                    "activity_id": activity_id,
+                    "buckets": buckets_data,
+                    "total_time_seconds": sum(b.secs or 0 for b in buckets),
+                },
+                query_type="power_histogram",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_hr_histogram(
+    activity_id: Annotated[str, "Activity ID to analyze"],
+    ctx: Context | None = None,
+) -> str:
+    """Time-in-zone DISTRIBUTION of heart rate within a single activity (histogram buckets, time per bucket).
+
+    Different from icu_get_hr_curves (best efforts across many activities).
+    Use for cardiovascular load breakdown and HR-zone time-in-zone.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            buckets = await client.get_hr_histogram(activity_id)
+
+            if not buckets:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"buckets": [], "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No HR histogram data available for this activity"},
+                )
+
+            buckets_data: list[dict[str, Any]] = [
+                {
+                    "hr_range": {
+                        "min_bpm": int(b.min) if b.min is not None else None,
+                        "max_bpm": int(b.max) if b.max is not None else None,
+                    },
+                    "time_seconds": b.secs or 0,
+                }
+                for b in buckets
+            ]
+
+            return ResponseBuilder.build_response(
+                data={
+                    "activity_id": activity_id,
+                    "buckets": buckets_data,
+                    "total_time_seconds": sum(b.secs or 0 for b in buckets),
+                },
+                query_type="hr_histogram",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_pace_histogram(
+    activity_id: Annotated[str, "Activity ID to analyze"],
+    ctx: Context | None = None,
+) -> str:
+    """Time-in-zone DISTRIBUTION of pace within a single running activity (histogram buckets, time per bucket).
+
+    Different from icu_get_pace_curves (best efforts across many activities).
+    Use for pace-distribution / consistency analysis. For elevation-
+    normalized pace use icu_get_gap_histogram.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            buckets = await client.get_pace_histogram(activity_id)
+
+            if not buckets:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"buckets": [], "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No pace histogram data available for this activity"},
+                )
+
+            buckets_data: list[dict[str, Any]] = [
+                {
+                    "pace_range": {"min": b.min, "max": b.max},
+                    "time_seconds": b.secs or 0,
+                }
+                for b in buckets
+            ]
+
+            return ResponseBuilder.build_response(
+                data={
+                    "activity_id": activity_id,
+                    "buckets": buckets_data,
+                    "total_time_seconds": sum(b.secs or 0 for b in buckets),
+                },
+                query_type="pace_histogram",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )
+
+
+async def get_gap_histogram(
+    activity_id: Annotated[str, "Activity ID to analyze"],
+    ctx: Context | None = None,
+) -> str:
+    """Time-in-zone DISTRIBUTION of grade-adjusted pace (GAP) within a single activity — elevation-normalized.
+
+    Use for trail running where raw pace is misleading. For raw (non-
+    elevation-normalized) pace use icu_get_pace_histogram.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            buckets = await client.get_gap_histogram(activity_id)
+
+            if not buckets:
+                analysis: dict[str, Any] = {}
+                strava_note = await fetch_strava_limitation_note(client, activity_id)
+                if strava_note:
+                    analysis["data_availability"] = strava_note
+                return ResponseBuilder.build_response(
+                    data={"buckets": [], "activity_id": activity_id},
+                    analysis=analysis if analysis else None,
+                    metadata={"message": "No GAP histogram data available for this activity"},
+                )
+
+            buckets_data: list[dict[str, Any]] = [
+                {
+                    "gap_range": {"min": b.min, "max": b.max},
+                    "time_seconds": b.secs or 0,
+                }
+                for b in buckets
+            ]
+
+            return ResponseBuilder.build_response(
+                data={
+                    "activity_id": activity_id,
+                    "buckets": buckets_data,
+                    "total_time_seconds": sum(b.secs or 0 for b in buckets),
+                    "note": "GAP (Grade Adjusted Pace) normalizes pace for elevation changes",
+                },
+                query_type="gap_histogram",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(e.message, error_type="api_error")
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}", error_type="internal_error"
+        )

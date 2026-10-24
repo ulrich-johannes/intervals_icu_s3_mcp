@@ -1,7 +1,8 @@
-# Two-stage build. vendor/intervals-icu-mcp is a git submodule and must be
-# checked out (git submodule update --init) before `docker build` runs --
-# see SPECIFICATION.md §03/§09/§11 open item #1 on whether Fly's native
-# GitHub-integration builder does this for us automatically.
+# Two-stage build. vendor/intervals-icu-mcp is a plain, fully-committed
+# copy of upstream (not a git submodule -- see SPECIFICATION.md §03), so
+# this builds correctly from a plain `git clone` or GitHub's own archive,
+# with no submodule-init step required by Fly's dashboard deploy or anyone
+# else building this image.
 FROM python:3.11-slim AS builder
 
 RUN pip install --no-cache-dir uv

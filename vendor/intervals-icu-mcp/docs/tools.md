@@ -1,0 +1,239 @@
+# Tool, Resource, and Prompt Reference
+
+Complete inventory of everything the Intervals.icu MCP server exposes: up to 69 tools across 11 categories, 4 MCP Resources, and 9 MCP Prompts.
+
+## Delete Safety Mode
+
+Destructive tools are gated by the optional `INTERVALS_ICU_DELETE_MODE` env var. The gate sits **outside the model's reach** — tools that aren't registered cannot be invoked by any prompt or parameter.
+
+| Mode | Registered tools | Events | Activities | Gear | Library workouts | Library folders | Sport settings | Custom items |
+|---|---|---|---|---|---|---|---|---|
+| `safe` (default) | 66 | tomorrow or later | ✗ | ✓ | ✓ | empty only | ✗ | ✗ |
+| `full` | 69 | any date | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `none` | 61 | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+
+In `safe` mode, `icu_delete_event`, `icu_bulk_delete_events`, and `icu_delete_workout_folder` return a uniform envelope showing what was deleted and what was skipped (the folder tool also adds a `folder` summary):
+
+```json
+{
+  "deleted": [124],
+  "deleted_count": 1,
+  "skipped": [
+    {
+      "id": 123,
+      "reason": "past_event",
+      "start_date_local": "2026-04-15",
+      "hint": "Past events (today and earlier) require INTERVALS_ICU_DELETE_MODE=full."
+    }
+  ],
+  "skipped_count": 1
+}
+```
+
+Set the mode in your client config alongside the credentials:
+
+```json
+"env": {
+  "INTERVALS_ICU_API_KEY": "your-api-key-here",
+  "INTERVALS_ICU_ATHLETE_ID": "i123456",
+  "INTERVALS_ICU_DELETE_MODE": "safe"
+}
+```
+
+**Events vs. activities — two separate records:** An event is a calendar entry (planned workout, race, note). An activity is a recorded workout synced from a device or uploaded manually. Completing a workout links the activity to the event, but both records remain independent — deleting one leaves the other intact. Deleting an event removes the plan from your calendar; the recorded data survives. Deleting an activity permanently removes the training data; the event remains on the calendar (reverting to an unexecuted plan). This is why `icu_delete_activity` is `full`-only: it destroys recorded training data with no recovery path. Event deletion is available in `safe` mode (future events only) because removing an unexecuted plan is low-stakes.
+
+**Why today is treated as past:** Safe mode only deletes events dated *strictly after today* in the server's local timezone. The one-day buffer absorbs server-vs-athlete TZ skew. If you run the server in Docker (defaults to UTC) and live in a different timezone, set the container's `TZ` env var to match your athlete profile (e.g., `TZ=Europe/Berlin`) so "today" lines up.
+
+**Why sport settings and custom items are full-only:** Sport-settings deletion removes the thresholds and zones that activities of that sport are analysed against from then on, and re-creating the record starts from defaults rather than restoring them. Custom items can be data-bearing fields whose values are stored across activities. Neither is recoverable by re-creating the deleted record.
+
+**Why library workouts are allowed in safe mode:** A library workout is a reusable template. Deleting one leaves calendar events (including ones created from it by `icu_apply_training_plan`) and recorded activities untouched, and the template can be rebuilt from its workout text — the same low-stakes profile as gear.
+
+**Why non-empty library folders are full-only:** Deleting a folder or plan also deletes every workout in it, so a single `icu_delete_workout_folder` call can remove a whole multi-week plan. Deleting an empty folder destroys nothing, so safe mode allows that and reports a folder that still holds workouts as `skipped` (reason `folder_not_empty`). Either way, calendar events already created from a plan by `icu_apply_training_plan` stay on the calendar — they are separate records, removed with `icu_delete_event`.
+
+## Tools
+
+### Coaching and following other athletes
+
+Athlete-scoped tools take an optional `athlete_id`. Omit it and the tool operates on
+`INTERVALS_ICU_ATHLETE_ID` from your config; pass it to target another athlete your
+account can reach (e.g. `athlete_id: "i999888"`). You use **your own** API key — never
+theirs. The API rejects IDs you can't access with HTTP 403.
+
+Use **`icu_list_athletes`** to discover valid ids. It returns everyone this account can
+reach, each with an `access` level (`self`, `coach`, `follower`, `none`) and a
+`can_write` flag, so you can tell up front whether a write will be permitted.
+
+Access comes from a relationship, not an account type — any Intervals.icu account can
+coach. The two relationships differ:
+
+| Relationship | Access |
+| --- | --- |
+| **Following** | read only |
+| **Coaching** | read + write (activities, calendar, FTP and training settings) |
+
+Both are established by request and acceptance, so an athlete must accept your coaching
+request before writes succeed. Whether coaches can write *every* athlete-scoped resource
+(gear and wellness in particular) is not documented upstream — those tools accept
+`athlete_id` and forward it, and the API is the authority on whether the write is allowed.
+
+Tools scoped by `activity_id` (activity details, streams, intervals, histograms,
+messages) take no `athlete_id` — an activity ID is globally unique and already
+identifies its owner.
+
+Note that `athlete_id` applies to the tools only. The `intervals-icu://athlete/profile`
+resource takes no arguments and always reflects the configured default athlete.
+
+### Activities (13 tools)
+
+| Tool                     | Description                                       |
+| ------------------------ | ------------------------------------------------- |
+| `icu_get_recent_activities`  | List recent activities with summary metrics       |
+| `icu_get_activities_by_date` | List activities in an explicit date window (oldest..newest) |
+| `icu_get_activity_details`   | Get comprehensive details for a specific activity |
+| `icu_search_activities`      | Search activities by name or tag                  |
+| `icu_search_activities_full` | Search activities with full details               |
+| `icu_get_activities_around`  | Get activities before and after a specific one    |
+| `icu_update_activity`        | Update activity name, description, or metadata    |
+| `icu_delete_activity`        | Delete an activity *(only registered when `INTERVALS_ICU_DELETE_MODE=full`)* |
+| `icu_download_activity_file` | Download original activity file                   |
+| `icu_download_fit_file`      | Download activity as FIT file                     |
+| `icu_download_gpx_file`      | Download activity as GPX file                     |
+| `icu_bulk_create_manual_activities` | Create multiple manual activities with upsert on external_id |
+| `icu_update_activity_streams` | Update raw timeseries streams for an activity (JSON or CSV) |
+
+### Activity Analysis (8 tools)
+
+| Tool                     | Description                                                   |
+| ------------------------ | ------------------------------------------------------------- |
+| `icu_get_activity_streams`   | Get time-series data (power, HR, cadence, altitude, GPS); `left_right_balance` is the right pedal's % |
+| `icu_get_activity_intervals` | Get structured workout intervals with targets and performance |
+| `icu_get_best_efforts`       | Find peak performances across all durations in an activity    |
+| `icu_search_intervals`       | Find similar intervals across activity history                |
+| `icu_get_power_histogram`    | Get power distribution histogram for an activity              |
+| `icu_get_hr_histogram`       | Get heart rate distribution histogram for an activity         |
+| `icu_get_pace_histogram`     | Get pace distribution histogram for an activity               |
+| `icu_get_gap_histogram`      | Get grade-adjusted pace histogram for an activity             |
+
+### Activity Messages (2 tools)
+
+The threaded notes/comments shown under an activity — the user's own training notes, comments from followers, or coach feedback.
+
+| Tool                       | Description                                                |
+| -------------------------- | ---------------------------------------------------------- |
+| `icu_get_activity_messages`    | Read notes/comments/coach feedback on a specific activity  |
+| `icu_add_activity_message`     | Post a note or comment on a specific activity              |
+
+### Athlete (5 tools)
+
+| Tool                  | Description                                                     |
+| --------------------- | --------------------------------------------------------------- |
+| `icu_list_athletes` | List athletes this account can access (self, followed, coached) with each one's access level, tags, and a preview of their athlete notes (`notes_truncated: true` when cut; full text via `icu_get_athlete_profile`) — use to resolve a name to an `athlete_id` |
+| `icu_get_athlete_profile` | Get athlete profile, fitness metrics, outdoor/indoor FTP, and athlete notes |
+| `icu_update_athlete_notes` | Replace (or clear) the free-text Markdown notes on an athlete's record |
+| `icu_get_fitness_summary` | Get detailed CTL/ATL/TSB analysis with training recommendations |
+| `icu_get_fitness_chart` | Get PMC time-series (CTL/ATL/TSB) over a date window, including future projections from planned workouts |
+
+### Wellness (3 tools)
+
+| Tool                    | Description                                                         |
+| ----------------------- | ------------------------------------------------------------------- |
+| `icu_get_wellness_data`     | Get recent wellness metrics with trends (HRV, sleep, mood, fatigue) |
+| `icu_get_wellness_for_date` | Get complete wellness data for a specific date                      |
+| `icu_update_wellness`       | Update or create wellness data for a date                           |
+
+### Events / Calendar (12 tools)
+
+| Tool                    | Description                                                |
+| ----------------------- | ---------------------------------------------------------- |
+| `icu_get_calendar_events`   | Get planned events and workouts from calendar              |
+| `icu_get_upcoming_workouts` | Upcoming planned WORKOUT **calendar events** only — not workout-library templates (see [Workout Library](#workout-library-8-tools)); returns event IDs |
+| `icu_get_annual_training_plan` | Read ATP periodization — weekly TSS targets, phases, ATP week notes (`week_note`; default: 365 days ahead; narrow with `days_ahead`/`days_back` for a specific month) |
+| `icu_get_event`             | Get details for a specific event                           |
+| `icu_create_event`          | Create new calendar events (workouts, races, notes, goals); optional `hide_from_athlete` / `athlete_cannot_edit` |
+| `icu_update_event`          | Modify existing calendar events (only the fields passed), including `hide_from_athlete` / `athlete_cannot_edit` |
+| `icu_delete_event`          | Remove an event from the calendar *(safe mode: future events only; envelope returns `deleted` / `skipped`)* |
+| `icu_bulk_create_events`    | Create multiple events in a single operation               |
+| `icu_bulk_update_event_access` | Hide/reveal or lock/unlock many planned WORKOUT events by ID list or date range — the web UI's "Hide from athlete" / "Athlete cannot edit" checkboxes. Other categories are reported as `skipped`; results split into `updated` / `unchanged` / `skipped` / `failed` |
+| `icu_bulk_delete_events`    | Delete multiple events in a single operation *(safe mode partitions into `deleted` / `skipped`)* |
+| `icu_duplicate_events`      | Duplicate one or more events with configurable copies and spacing |
+| `icu_apply_training_plan` | Apply an entire training plan (workout folder) onto the calendar |
+
+### Performance / Curves (3 tools)
+
+| Tool               | Description                                              |
+| ------------------ | -------------------------------------------------------- |
+| `icu_get_power_curves` | Analyze power curves with FTP estimation and power zones |
+| `icu_get_hr_curves`    | Analyze heart rate curves with HR zones                  |
+| `icu_get_pace_curves`  | Analyze running/swimming pace curves with optional GAP   |
+
+### Workout Library (8 tools)
+
+| Tool                     | Description                               |
+| ------------------------ | ----------------------------------------- |
+| `icu_get_workout_library`    | Browse workout folders and training plans |
+| `icu_get_workouts_in_folder` | View all workouts in a specific folder (includes plan `day`) |
+| `icu_create_workout`         | Save a reusable workout to an existing folder or plan (optional plan `day`) |
+| `icu_update_workout`         | Change fields on a library workout (only provided fields are sent) |
+| `icu_delete_workout`         | Delete a library workout *(registered in `safe` and `full` modes)* |
+| `icu_bulk_create_workouts`   | Save multiple library workouts in a single operation (e.g. filling out a plan) |
+| `icu_create_workout_folder`  | Create a new workout folder (`FOLDER`) or training plan (`PLAN`) |
+| `icu_delete_workout_folder`  | Delete a folder or plan and every workout in it *(safe mode: empty folders only; envelope returns `deleted` / `skipped`)* |
+
+### Gear Management (6 tools)
+
+| Tool                   | Description                                |
+| ---------------------- | ------------------------------------------ |
+| `icu_get_gear_list`        | Get all gear items with usage and status   |
+| `icu_create_gear`          | Add new gear to tracking                   |
+| `icu_update_gear`          | Update gear details, mileage, or status    |
+| `icu_delete_gear`          | Remove gear from tracking                  |
+| `icu_create_gear_reminder` | Create maintenance reminders for gear      |
+| `icu_update_gear_reminder` | Update existing gear maintenance reminders |
+
+### Sport Settings (4 tools)
+
+| Tool                    | Description                                             |
+| ----------------------- | ------------------------------------------------------- |
+| `icu_get_sport_settings`    | Get per-sport thresholds plus configured power/HR/pace zones |
+| `icu_update_sport_settings` | Update outdoor/indoor FTP, FTHR, or pace/swim thresholds, or set explicit HR/power zone bounds (e.g. from a lab test) |
+| `icu_create_sport_settings` | Create new sport-specific settings                      |
+| `icu_delete_sport_settings` | Delete sport-specific settings *(only registered when `INTERVALS_ICU_DELETE_MODE=full`; past activities keep their analysed values, but re-creating the record starts from defaults)* |
+
+### Custom Items (5 tools)
+
+The user's personal additions to their account: custom charts on dashboards, custom data fields on wellness/activities/intervals, custom power/HR/pace zone configurations, custom activity panels, and custom computed streams. The Intervals.icu API umbrella name is "custom items".
+
+| Tool                    | Description                                                                |
+| ----------------------- | -------------------------------------------------------------------------- |
+| `icu_get_custom_items`      | List the user's custom additions (charts, fields, zones, panels, etc.)     |
+| `icu_get_custom_item`       | Fetch the full configuration of one custom addition by ID                  |
+| `icu_create_custom_item`    | Add a new custom chart, field, zones config, or dashboard panel            |
+| `icu_update_custom_item`    | Modify an existing custom addition (rename, reconfigure, change visibility)|
+| `icu_delete_custom_item`    | Permanently remove a custom addition *(only registered when `INTERVALS_ICU_DELETE_MODE=full`; data-bearing field types may cascade)* |
+
+## MCP Resources
+
+Resources provide ongoing context to the LLM without requiring explicit tool calls.
+
+| Resource                              | Description                                                              |
+| ------------------------------------- | ------------------------------------------------------------------------ |
+| `intervals-icu://athlete/profile`     | Complete athlete profile with current fitness metrics and sport settings |
+| `intervals-icu://workout-syntax`      | Structured workout syntax reference for generating valid Intervals.icu workouts (cycling, running, swimming) |
+| `intervals-icu://event-categories`    | Calendar event category enum (WORKOUT, RACE_A/B/C, HOLIDAY, …), training_availability values, legacy aliases, and use-case guidance for create_event / update_event / bulk_create_events |
+| `intervals-icu://custom-item-schemas` | Per-item_type `content` schema for create_custom_item / update_custom_item — INPUT_FIELD/ACTIVITY_FIELD/INTERVAL_FIELD constraints with worked examples; chart/panel/zones/stream guidance |
+
+## MCP Prompts
+
+Prompt templates for common queries, accessible via prompt suggestions in Claude.
+
+| Prompt                    | Description                                                              |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `icu_analyze_recent_training` | Comprehensive training analysis over a specified period                  |
+| `icu_performance_analysis`    | Detailed power/HR/pace curve analysis with zones                         |
+| `icu_activity_deep_dive`      | Deep dive into a specific activity with streams, intervals, best efforts |
+| `icu_recovery_check`          | Recovery assessment with wellness trends and training load               |
+| `icu_training_plan_review`    | Weekly training plan evaluation with workout library                     |
+| `icu_plan_training_week`      | AI-assisted weekly training plan creation based on current fitness       |
+| `generate_workout`            | Generate a structured workout with sport, type, and duration parameters  |
+| `verify_setup`                | Exercise core tools against your account to verify the server works      |
+| `verify_multi_athlete`        | Verify coach/multi-athlete access by querying another athlete's data     |

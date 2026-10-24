@@ -1,0 +1,114 @@
+# Usage Examples
+
+Ask Claude to interact with your Intervals.icu data using natural language. This page collects example prompts organized by tool category. For the full tool reference, see [tools.md](tools.md).
+
+## MCP Prompts
+
+Built-in prompt templates for common queries, available via prompt suggestions in Claude:
+
+- `analyze-recent-training` — comprehensive training analysis over a specified period
+- `performance-analysis` — analyze power/HR/pace curves and zones
+- `activity-deep-dive` — deep dive into a specific activity with streams, intervals, and best efforts
+- `recovery-check` — recovery assessment with wellness trends and training load
+- `training-plan-review` — weekly training plan evaluation with workout library
+- `plan-training-week` — AI-assisted weekly training plan creation based on current fitness
+- `generate-workout` — generate a structured workout for any sport (cycling, running, swimming) with proper Intervals.icu syntax
+
+## Activities
+
+```
+"Show me my activities from the last 30 days"
+"Get details for my last long run"
+"Find all my threshold workouts"
+"Update the name of my last activity"
+"Delete that duplicate activity"
+"Download the FIT file for my race"
+```
+
+## Activity Analysis
+
+```
+"Show me the power data from yesterday's ride"
+"What were my best efforts in my last race?"
+"Find similar interval workouts to my last session"
+"Show me the intervals from my workout on Tuesday"
+"Get the power histogram for my last ride"
+"Show me the heart rate distribution for that workout"
+```
+
+## Athlete Profile & Fitness
+
+```
+"Show my current fitness metrics and training load"
+"Am I overtraining? Check my CTL, ATL, and TSB"
+"What do my athlete notes say?"
+"Add to my athlete notes that I'm rehabbing my left knee until November"
+```
+
+_Note: The athlete profile resource (`intervals-icu://athlete/profile`) automatically provides ongoing context._
+
+## Wellness & Recovery
+
+```
+"How's my recovery this week? Show HRV and sleep trends"
+"What was my wellness data for yesterday?"
+"Update my wellness data for today - I slept 8 hours and feel great"
+```
+
+## Calendar & Planning
+
+```
+"What workouts do I have planned this week?"
+"What's my weekly TSS target this month?"
+"What training phase am I in — Base, Build, or Peak?"
+"When are my recovery weeks?"
+"Create a sweet spot cycling workout for tomorrow"
+"Create a tempo run with 800m repeats for Wednesday"
+"Generate a CSS swim training session for Friday"
+"Update my workout on Friday"
+"Delete the workout on Saturday"
+"Duplicate this week's plan for next week"
+"Create 5 workouts for my build phase"
+"Hide my athlete's workouts for weeks 41 to 43 until I reveal them"   (coach)
+"Lock the FTP test and race-prep sessions so my athlete can't move them"   (coach)
+```
+
+> **Structured Workouts**: The server includes a complete workout syntax reference (`intervals-icu://workout-syntax`) that enables LLMs to generate valid structured workouts with proper power/HR/pace targets, zones, ramps, repeats, and cadence for cycling, running, and swimming.
+
+## Performance Analysis
+
+```
+"What's my 20-minute power and FTP?"
+"Show me my heart rate zones"
+"Analyze my running pace curve"
+```
+
+## Workout Library
+
+```
+"Show me my workout library"
+"What workouts are in my threshold folder?"
+"Save a 3x10min threshold session to my Threshold folder"
+"Make my Recovery Week workout 30 minutes shorter"
+"Build a 4-week sweet-spot training plan in my library"
+```
+
+## Gear Management
+
+```
+"Show me my gear list"
+"Add my new running shoes to gear tracking"
+"Create a reminder to replace my bike chain at 3000km"
+"Update the mileage on my road bike"
+```
+
+## Sport Settings
+
+```
+"Update my FTP to 275 watts"
+"Set my indoor FTP to 260 watts"
+"Show my current FTP and thresholds for cycling"
+"Set my running threshold pace to 4:30 per kilometer"
+"My lab test put VT1 at 145 bpm and VT2 at 172 — set my Ride HR zones to 130/145/165/172/188"
+"I entered my HR zones wrong last year — reapply the corrected zones to all my past rides"
+```

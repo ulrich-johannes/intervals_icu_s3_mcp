@@ -1,0 +1,742 @@
+"""Pydantic models for Intervals.icu API responses."""
+
+import math
+from datetime import datetime
+from typing import Any, Literal, cast, get_args
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Type aliases for common enums
+# Full Intervals.icu activity discipline enum for the `type` field, mirrored
+# from openapi-spec.json (the import-workout `type` parameter enum — the events
+# endpoint validates against the same set, rejecting unknown values with 422
+# "Invalid type"; live-verified). tests/test_activity_disciplines.py keeps this
+# mirror in sync as the weekly spec update lands.
+ActivityType = Literal[
+    "Ride",
+    "Run",
+    "Swim",
+    "WeightTraining",
+    "Hike",
+    "Walk",
+    "AlpineSki",
+    "BackcountrySki",
+    "Badminton",
+    "Canoeing",
+    "Crossfit",
+    "EBikeRide",
+    "EMountainBikeRide",
+    "Elliptical",
+    "Golf",
+    "GravelRide",
+    "TrackRide",
+    "Handcycle",
+    "HighIntensityIntervalTraining",
+    "Hockey",
+    "IceSkate",
+    "InlineSkate",
+    "Kayaking",
+    "Kitesurf",
+    "MountainBikeRide",
+    "Cyclocross",
+    "NordicSki",
+    "OpenWaterSwim",
+    "Padel",
+    "Pilates",
+    "Pickleball",
+    "Racquetball",
+    "Rugby",
+    "RockClimbing",
+    "RollerSki",
+    "Rowing",
+    "Sail",
+    "Skateboard",
+    "Snowboard",
+    "Snowshoe",
+    "Soccer",
+    "Squash",
+    "StairStepper",
+    "StandUpPaddling",
+    "Surfing",
+    "TableTennis",
+    "Tennis",
+    "TrailRun",
+    "Transition",
+    "Velomobile",
+    "VirtualRide",
+    "VirtualRow",
+    "VirtualRun",
+    "VirtualSki",
+    "WaterSport",
+    "Wheelchair",
+    "Windsurf",
+    "Workout",
+    "Yoga",
+    "Other",
+]
+# Runtime view of ActivityType, for rendering hints and resources.
+ACTIVITY_DISCIPLINES: tuple[str, ...] = get_args(ActivityType)
+EventCategory = Literal[
+    "WORKOUT",
+    "NOTE",
+    "RACE_A",
+    "RACE_B",
+    "RACE_C",
+    "TARGET",
+    "PLAN",
+    "HOLIDAY",
+    "SICK",
+    "INJURED",
+    "SET_EFTP",
+    "FITNESS_DAYS",
+    "SEASON_START",
+    "SET_FITNESS",
+    "RACE",
+    "GOAL",
+]
+TrainingAvailability = Literal["NORMAL", "LIMITED", "UNAVAILABLE"]
+
+
+# ==================== Athlete Models ====================
+
+_SWIM_SPORT_TYPES = frozenset({"Swim", "OpenWaterSwim"})
+
+
+class SportSettings(BaseModel):
+    """Sport-specific settings for an athlete."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    type: str | None = None
+
+    # Default workout timings (seconds)
+    warmup_time: int | None = None
+    cooldown_time: int | None = None
+
+    # Power
+    ftp: int | None = None
+    indoor_ftp: int | None = None
+    power_zones: list[int] = Field(default_factory=list[int])
+    power_zone_names: list[str] = Field(default_factory=list[str])
+    sweet_spot_min: int | None = None
+    sweet_spot_max: int | None = None
+
+    # Heart rate
+    fthr: int | None = None
+    max_hr: int | None = None
+    hr_zones: list[int] = Field(default_factory=list[int])
+    hr_zone_names: list[str] = Field(default_factory=list[str])
+    hr_load_type: str | None = None
+    hrrc_min_percent: float | None = None
+
+    # Pace
+    pace_threshold: float | None = None
+    swim_threshold: float | None = None
+    pace_zones: list[float] = Field(default_factory=list[float])
+    pace_zone_names: list[str] = Field(default_factory=list[str])
+
+    @field_validator(
+        "power_zones",
+        "power_zone_names",
+        "hr_zones",
+        "hr_zone_names",
+        "pace_zones",
+        "pace_zone_names",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_zone_lists(cls, v: Any) -> list[Any]:
+        # The API sends null (not []) for zone sets a sport doesn't use — e.g. a Run
+        # record carries power_zones: null.
+        return v or []
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_api_fields(cls, data: Any) -> Any:
+        """Map Intervals.icu SportSettings JSON to MCP field names."""
+        if not isinstance(data, dict):
+            return data
+
+        raw = cast(dict[str, Any], data)
+        normalized: dict[str, Any] = dict(raw)
+        types = raw.get("types")
+        if isinstance(types, list) and types and normalized.get("type") is None:
+            normalized["type"] = types[0]
+
+        if raw.get("lthr") is not None and normalized.get("fthr") is None:
+            normalized["fthr"] = raw["lthr"]
+
+        threshold_pace = raw.get("threshold_pace")
+        if threshold_pace is not None:
+            pace_load_type = raw.get("pace_load_type")
+            sport_types = cast(list[Any], types) if isinstance(types, list) else []
+            is_swim = pace_load_type == "SWIM" or any(
+                isinstance(t, str) and t in _SWIM_SPORT_TYPES for t in sport_types
+            )
+            # The API stores threshold_pace as SPEED in m/s for every sport (pace_units only
+            # controls display), so convert to min/km (run) or min/100m (swim) here. Treating
+            # run as min/km misread 4:40/km (3.571 m/s) as "3:34 /km" (#152, #88).
+            if is_swim:
+                if normalized.get("swim_threshold") is None:
+                    normalized["swim_threshold"] = (
+                        (100.0 / threshold_pace) / 60.0 if threshold_pace else None
+                    )
+            elif normalized.get("pace_threshold") is None:
+                normalized["pace_threshold"] = (
+                    (1000.0 / threshold_pace) / 60.0 if threshold_pace else None
+                )
+
+        return normalized
+
+
+class Athlete(BaseModel):
+    """Full athlete profile information."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    name: str
+    email: str | None = None
+    weight: float | None = None
+    dob: str | None = None
+    sex: str | None = None
+    created: datetime | None = None
+    ctl: float | None = None
+    atl: float | None = None
+    tsb: float | None = None
+    ramp_rate: float | None = None
+    icu_notes: str | None = None
+    sport_settings: list[SportSettings] = Field(
+        default_factory=list[SportSettings],
+        validation_alias=AliasChoices("sport_settings", "sportSettings"),
+    )
+
+    @field_validator("sport_settings", mode="before")
+    @classmethod
+    def _coerce_sport_settings(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+class AthleteProfile(BaseModel):
+    """Simplified athlete profile."""
+
+    id: str
+    name: str
+    email: str | None = None
+    weight: float | None = None
+    ctl: float | None = None
+    atl: float | None = None
+    tsb: float | None = None
+
+
+# ==================== Activity Models ====================
+
+
+class ActivitySummary(BaseModel):
+    """Summary representation of an activity (for lists)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    start_date_local: datetime
+    name: str | None = None
+    type: str | None = None
+    distance: float | None = None
+    moving_time: int | None = None
+    elapsed_time: int | None = None
+    total_elevation_gain: float | None = None
+    average_speed: float | None = None
+    average_heartrate: int | None = None
+    average_watts: int | None = Field(default=None, alias="icu_average_watts")
+    normalized_power: int | None = None
+    average_cadence: float | None = None
+    icu_training_load: int | None = None
+    icu_intensity: float | None = None
+    source: str | None = None
+    note: str | None = Field(default=None, alias="_note")
+
+
+class Activity(ActivitySummary):
+    """Detailed activity with full information."""
+
+    athlete_id: str | None = None
+    description: str | None = None
+    calories: int | None = None
+    carbs_ingested: int | None = None
+    carbs_used: int | None = None
+    device_name: str | None = None
+    max_heartrate: int | None = None
+    max_speed: float | None = None
+    max_watts: int | None = None
+    max_cadence: float | None = None
+    weighted_average_watts: int | None = Field(default=None, alias="icu_weighted_avg_watts")
+    variability_index: float | None = None
+    efficiency_factor: float | None = None
+    tss: float | None = None
+    hrss: float | None = None
+    trimp: float | None = None
+    feel: int | None = None
+    # Intervals.icu stores the athlete-entered RPE in `icu_rpe` (int 1-10).
+    # `perceived_exertion` is the Strava-imported mirror of the same rating and
+    # is a float in the API spec, so it is only read as a fallback — otherwise a
+    # fractional import would shadow the native value. `_resolve_rpe` below does
+    # the actual falling back; the alias order only covers a response that omits
+    # `icu_rpe` entirely.
+    perceived_exertion: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("icu_rpe", "perceived_exertion"),
+    )
+    compliance: float | None = None
+    avg_lr_balance: float | None = None
+    commute: bool | None = None
+    trainer: bool | None = None
+    indoor: bool | None = None
+    analyzed: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_rpe(cls, data: Any) -> Any:
+        """Fall back to the Strava-imported RPE when the native one is null.
+
+        The API always sends `icu_rpe`, explicitly null when the athlete has not
+        entered an RPE, and `AliasChoices` resolves on key presence rather than
+        null-ness — so on its own the fallback would never fire in production.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        raw = cast(dict[str, Any], data)
+        if raw.get("icu_rpe") is None and raw.get("perceived_exertion") is not None:
+            resolved: dict[str, Any] = dict(raw)
+            resolved["icu_rpe"] = resolved["perceived_exertion"]
+            return resolved
+        return raw
+
+    @field_validator("perceived_exertion", mode="before")
+    @classmethod
+    def _round_perceived_exertion(cls, v: Any) -> Any:
+        """RPE is a whole number on the 1-10 scale, but `perceived_exertion` is
+        typed float by the API. Round rather than fail the whole activity."""
+        if isinstance(v, float):
+            return math.floor(v + 0.5) if math.isfinite(v) else None
+        return v
+
+
+class ActivitySearchResult(BaseModel):
+    """Search result for activities."""
+
+    id: str
+    name: str | None = None
+    start_date_local: datetime
+    type: str | None = None
+    distance: float | None = None
+    moving_time: int | None = None
+
+
+# ==================== Wellness Models ====================
+
+
+class SportInfo(BaseModel):
+    """Per-sport context attached to a wellness record."""
+
+    type: str | None = None
+    eftp: float | None = None
+    w_prime: float | None = Field(None, alias="wPrime")
+    p_max: float | None = Field(None, alias="pMax")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class Wellness(BaseModel):
+    """Wellness record with health metrics.
+
+    `extra="allow"` lets us surface fields that the Intervals.icu API may add
+    in the future without losing them silently — every field the API returns
+    is preserved on the model, even if not enumerated here.
+    """
+
+    id: str  # ISO-8601 date
+    weight: float | None = None
+    resting_hr: int | None = Field(None, alias="restingHR")
+    hrv: float | None = None
+    hrv_sdnn: float | None = Field(None, alias="hrvSDNN")
+    sleep_secs: int | None = Field(None, alias="sleepSecs")
+    sleep_quality: int | None = Field(None, alias="sleepQuality")
+    sleep_score: float | None = Field(None, alias="sleepScore")
+    avg_sleeping_hr: float | None = Field(None, alias="avgSleepingHR")
+    fatigue: int | None = None
+    soreness: int | None = None
+    stress: int | None = None
+    mood: int | None = None
+    motivation: int | None = None
+    injury: int | None = None
+    spo2: float | None = Field(None, alias="spO2")
+    respiration: float | None = None
+    hydration: int | None = None
+    hydration_volume: float | None = Field(None, alias="hydrationVolume")
+    kcal_consumed: int | None = Field(None, alias="kcalConsumed")
+    carbohydrates: float | None = None
+    protein: float | None = None
+    fat_total: float | None = Field(None, alias="fatTotal")
+    menstrual_phase: str | None = Field(None, alias="menstrualPhase")
+    menstrual_phase_predicted: str | None = Field(None, alias="menstrualPhasePredicted")
+    systolic: int | None = None
+    diastolic: int | None = None
+    blood_glucose: float | None = Field(None, alias="bloodGlucose")
+    lactate: float | None = None
+    body_fat: float | None = Field(None, alias="bodyFat")
+    abdomen: float | None = None
+    vo2max: float | None = None
+    readiness: float | None = None
+    baevsky_si: float | None = Field(None, alias="baevskySI")
+    steps: int | None = None
+    comments: str | None = None
+    ctl: float | None = None
+    atl: float | None = None
+    tsb: float | None = None  # Training Stress Balance
+    ctl_load: float | None = Field(None, alias="ctlLoad")
+    atl_load: float | None = Field(None, alias="atlLoad")
+    ramp_rate: float | None = Field(None, alias="rampRate")
+    sport_info: list[SportInfo] = Field(default_factory=list[SportInfo], alias="sportInfo")
+    locked: bool | None = None
+    temp_weight: bool | None = Field(None, alias="tempWeight")
+    temp_resting_hr: bool | None = Field(None, alias="tempRestingHR")
+    updated: datetime | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    @field_validator("sport_info", mode="before")
+    @classmethod
+    def _coerce_sport_info(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+# ==================== Event/Calendar Models ====================
+
+
+class Event(BaseModel):
+    """Calendar event (planned workout, note, race, etc.)."""
+
+    id: int
+    start_date_local: str  # ISO-8601 date
+    end_date_local: str | None = None
+    category: str | None = None  # See EventCategory for valid values
+    name: str | None = None
+    description: str | None = None
+    type: str | None = None
+    distance: float | None = None
+    distance_target: float | None = None
+    load_target: int | None = None
+    time_target: int | None = None
+    tags: list[str] | None = None
+    moving_time: int | None = None
+    icu_training_load: int | None = Field(None, alias="icu_training_load")
+    icu_intensity: float | None = Field(None, alias="icu_intensity")
+    icu_atl: float | None = Field(None, alias="icu_atl")
+    icu_ctl: float | None = Field(None, alias="icu_ctl")
+    joules: int | None = None
+    joules_above_ftp: int | None = Field(None, alias="joules_above_ftp")
+    color: str | None = None
+    training_availability: str | None = None
+    show_as_note: bool | None = None
+    not_on_fitness_chart: bool | None = None
+    show_on_ctl_line: bool | None = None
+    hide_from_athlete: bool | None = Field(None, alias="hide_from_athlete")
+    athlete_cannot_edit: bool | None = Field(None, alias="athlete_cannot_edit")
+    external_id: str | None = Field(None, alias="external_id")
+    created_by_id: str | None = Field(None, alias="created_by_id")
+    plan_applied: str | None = Field(None, alias="plan_applied")
+    # Parsed structured-workout doc. Always present for WORKOUT events, but its
+    # `steps` list is empty when the description did not parse (prose / non-native
+    # format). Used to echo a parse signal back to the caller.
+    workout_doc: dict[str, Any] | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ==================== Workout Library Models ====================
+
+
+class Workout(BaseModel):
+    """Workout from library."""
+
+    id: int
+    athlete_id: str | None = Field(None, alias="athlete_id")
+    name: str | None = None
+    description: str | None = None
+    folder_id: int | None = Field(None, alias="folder_id")
+    moving_time: int | None = Field(None, alias="moving_time")
+    distance: float | None = None
+    icu_training_load: int | None = Field(None, alias="icu_training_load")
+    icu_intensity: float | None = Field(None, alias="icu_intensity")
+    joules: int | None = None
+    joules_above_ftp: int | None = Field(None, alias="joules_above_ftp")
+    indoor: bool | None = None
+    color: str | None = None
+    type: str | None = None
+    day: int | None = None  # Day offset within a PLAN folder
+    target: str | None = None
+    tags: list[str] | None = None
+    # Parsed structured-workout doc; `steps` is empty when the description did not parse.
+    workout_doc: dict[str, Any] | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class Folder(BaseModel):
+    """Workout folder or training plan."""
+
+    id: int
+    athlete_id: str | None = Field(None, alias="athlete_id")
+    type: str | None = None  # FOLDER or PLAN
+    name: str | None = None
+    description: str | None = None
+    num_workouts: int | None = Field(None, alias="num_workouts")
+    start_date_local: str | None = Field(None, alias="start_date_local")
+    duration_weeks: int | None = Field(None, alias="duration_weeks")
+    hours_per_week_min: int | None = Field(None, alias="hours_per_week_min")
+    hours_per_week_max: int | None = Field(None, alias="hours_per_week_max")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ==================== Power Curve Models ====================
+
+
+class CurveData(BaseModel):
+    """A single curve from the API (one time range)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    secs: list[int] = Field(default_factory=lambda: list[int]())
+    values: list[int] = Field(default_factory=lambda: list[int]())
+    activity_id: list[str] = Field(default_factory=lambda: list[str]())
+    watts_per_kg: list[float] = Field(default_factory=lambda: list[float]())
+    start_date_local: str | None = None
+    end_date_local: str | None = None
+    days: int | None = None
+    weight: float | None = None
+
+    @field_validator("secs", "values", "activity_id", "watts_per_kg", mode="before")
+    @classmethod
+    def _coerce_lists(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+class CurveSet(BaseModel):
+    """Wrapper returned by all curve API endpoints (power, HR, pace)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    curves: list[CurveData] = Field(default_factory=lambda: list[CurveData](), alias="list")
+
+    @field_validator("curves", mode="before")
+    @classmethod
+    def _coerce_curves(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+# ==================== Training Plan Models ====================
+
+
+class AthleteTrainingPlan(BaseModel):
+    """Athlete's current training plan."""
+
+    athlete_id: str | None = Field(None, alias="athlete_id")
+    folder_id: int | None = Field(None, alias="folder_id")
+    plan_name: str | None = Field(None, alias="plan_name")
+    start_date_local: str | None = Field(None, alias="start_date_local")
+    end_date_local: str | None = Field(None, alias="end_date_local")
+    weeks_remaining: int | None = Field(None, alias="weeks_remaining")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ==================== Generic Response Models ====================
+
+
+class APIError(BaseModel):
+    """Error response from API."""
+
+    message: str
+    status_code: int | None = None
+
+
+# ==================== Supporting Models ====================
+
+
+class FitnessSummary(BaseModel):
+    """Custom model for aggregated fitness metrics."""
+
+    ctl: float | None = None  # Chronic Training Load (Fitness)
+    atl: float | None = None  # Acute Training Load (Fatigue)
+    tsb: float | None = None  # Training Stress Balance (Form)
+    ramp_rate: float | None = None  # Rate of fitness change
+    date: str | None = None
+    interpretation: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("interpretation", mode="before")
+    @classmethod
+    def _coerce_interpretation(cls, v: Any) -> dict[str, Any]:
+        return v or {}
+
+
+# ==================== Activity Interval Models ====================
+
+
+class Interval(BaseModel):
+    """Activity interval data."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: int | None = None
+    type: str | None = None  # e.g., "WORK", "REST", "WARM_UP", "COOL_DOWN"
+    start: int | None = None  # Start time in seconds
+    end: int | None = None  # End time in seconds
+    duration: int | None = None  # Duration in seconds
+    distance: float | None = None
+    average_watts: int | None = None
+    normalized_power: int | None = None
+    average_heartrate: int | None = None
+    max_heartrate: int | None = None
+    average_cadence: float | None = None
+    average_speed: float | None = None
+    target: str | None = None  # Target description
+    target_min: float | None = None
+    target_max: float | None = None
+
+
+class IntervalsDTO(BaseModel):
+    """Response from the intervals endpoint — wraps the interval list."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str | None = None
+    icu_intervals: list[Interval] = Field(default_factory=lambda: list[Interval]())
+
+    @field_validator("icu_intervals", mode="before")
+    @classmethod
+    def _coerce_icu_intervals(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+# ==================== Activity Streams Models ====================
+
+
+class ActivityStream(BaseModel):
+    """A single stream returned by the API."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str | None = None
+    name: str | None = None
+    data: Any = None
+    data2: Any = None  # Longitude for type latlng (latitude is in data)
+
+
+# ==================== Best Efforts Models ====================
+
+
+class Effort(BaseModel):
+    """Single best effort entry from the API."""
+
+    start_index: int | None = None
+    end_index: int | None = None
+    average: float | None = None
+    duration: int | None = None
+    distance: float | None = None
+
+
+class BestEfforts(BaseModel):
+    """Response from the best-efforts endpoint."""
+
+    efforts: list[Effort] = Field(default_factory=lambda: list[Effort]())
+
+    @field_validator("efforts", mode="before")
+    @classmethod
+    def _coerce_efforts(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+# ==================== Gear Models ====================
+
+
+class GearReminder(BaseModel):
+    """Gear maintenance reminder.
+
+    Mirrors the API schema: `distance` (m), `time` (s), `activities`, and
+    `days` are recurring trigger thresholds (0 = threshold unused); the
+    `*_used` fields track consumption since `last_reset`.
+    """
+
+    id: int
+    gear_id: str | None = None
+    name: str | None = None
+    distance: float | None = None
+    time: float | None = None
+    activities: int | None = None
+    days: int | None = None
+    last_reset: str | None = None
+    starting_distance: float | None = None
+    starting_time: float | None = None
+    starting_activities: int | None = None
+    snoozed_until: str | None = None
+    percent_used: float | None = None
+    distance_used: float | None = None
+    time_used: float | None = None
+    activities_used: int | None = None
+    days_used: int | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class Gear(BaseModel):
+    """Gear/equipment item.
+
+    Mirrors the API schema: `type` is a CamelCase enum value ("Bike",
+    "Shoes", "Trainer", plus component types like "Chain" or "Cassette"),
+    `retired` is a date string (null = in active use), and `distance` (m) /
+    `time` (s) / `activities` are accumulated usage. The API has no brand,
+    model, active, or primary fields on gear.
+    """
+
+    id: str
+    athlete_id: str | None = None
+    name: str | None = None
+    type: str | None = None
+    purchased: str | None = None
+    notes: str | None = None
+    distance: float | None = None
+    time: float | None = None
+    activities: int | None = None
+    use_elapsed_time: bool | None = None
+    retired: str | None = None
+    component: bool | None = None
+    component_ids: list[str] = Field(default_factory=list)
+    reminders: list[GearReminder] = Field(default_factory=list[GearReminder])
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("reminders", "component_ids", mode="before")
+    @classmethod
+    def _coerce_null_lists(cls, v: Any) -> list[Any]:
+        return v or []
+
+
+# ==================== Histogram Models ====================
+
+
+class Bucket(BaseModel):
+    """One bucket in a histogram returned by the Intervals.icu API.
+
+    The API returns histogram endpoints as a bare JSON array of these buckets,
+    sorted by `min` ascending. `secs` is time-in-bucket; the API does not
+    return raw sample counts or per-bucket moving time. (The OpenAPI spec
+    documents a richer shape with `start`/`movingSecs`/etc. — those fields are
+    not actually populated by any of the histogram endpoints.)
+    """
+
+    min: float | None = None
+    max: float | None = None
+    secs: int | None = None
