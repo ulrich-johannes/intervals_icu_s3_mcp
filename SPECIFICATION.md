@@ -111,13 +111,14 @@ Separate from the upstream-contract suite above: every module we actually write 
 
 ## 05 Configuration
 
-All env-driven, loaded via Fly's dashboard Secrets tab in production. **Revised from datastore-mcp's pattern**: a missing or invalid variable does not crash the process at boot. See §14.
+All env-driven, loaded via Fly's dashboard Secrets tab in production. **Revised from datastore-mcp's pattern**: a missing or invalid variable does not crash the process at boot. See §13.
 
 | Variable | Source | Notes |
 | --- | --- | --- |
 | `PUBLIC_URL` | ours | External base URL for OAuth issuer/redirect URLs |
 | `PORT` | ours | HTTP listen port (8080 on Fly) |
 | `OAUTH_USERNAME` / `OAUTH_PASSWORD` | ours | Gates the login form, same as datastore-mcp |
+| `OAUTH_STATE_SECRET` | ours | Encrypts the persisted OAuth session blob before it's written to S3 (§16) — independent of the two above |
 | `INTERVALS_ICU_API_KEY` | upstream, passthrough | Single athlete's intervals.icu API key |
 | `INTERVALS_ICU_ATHLETE_ID` | upstream, passthrough | |
 | `INTERVALS_ICU_DELETE_MODE` | upstream, passthrough | `safe` / `full` / `none` — decides which destructive tools upstream even *registers* |
@@ -142,6 +143,8 @@ Same five tools and semantics as datastore-mcp's `mcp_state` table, re-implement
 ## 08 Authorization flow
 
 Ported design, not ported code (different language): same self-issued OAuth 2.1 authorization-code-plus-PKCE server, single username/password pair (`OAUTH_USERNAME`/`OAUTH_PASSWORD`), no third-party IdP. Dynamic Client Registration stays open (any client may self-register); the real access boundary is the login form. Access tokens are opaque, one-hour TTL, no refresh tokens — an expired session re-runs login. All of this state (clients, pending logins, codes, tokens) lives in-process, which is the other reason (besides upstream's own design) this stays a single machine.
+
+**Revised**: registered clients and issued access tokens are now also persisted to S3 (§16), specifically so a machine *restart* doesn't force a full reconnect — the in-process dicts remain the sole source of truth during a request, and the single-machine constraint is unchanged; persistence only survives a restart, it does not enable a second machine to share state safely.
 
 ## 09 Deployment (Fly.io, GitOps)
 
@@ -204,9 +207,27 @@ Once everything required is present, `build_configured_app()` runs exactly as de
 
 ## 14 Keeping a fork current
 
-README.md has the end user fork this repository (rather than deploy from the upstream repo directly) so that Fly's GitHub integration has a repository they actually have push access to connect to. The cost: a fork is a frozen snapshot, so improvements to this project don't reach a deployed instance by themselves. The fix adopted is GitHub's own one-click **"Sync fork" → "Update branch"** button — this fast-forwards the fork's `main` to match upstream, which is a normal push, so Fly's existing continuous-deployment hook (set up once in §09/§13) redeploys automatically from it. No CLI either way, but it is explicitly a manual check-in: nothing notifies the user that an update exists. Documented as a trade-off, not hidden as "automatic."
+README.md has the end user fork this repository (rather than deploy from the upstream repo directly) so that Fly's GitHub integration has a repository they actually have push access to connect to. The cost: a fork is a frozen snapshot, so improvements to this project don't reach a deployed instance by themselves. The fix adopted is GitHub's own one-click **"Sync fork" → "Update branch"** button — this fast-forwards the fork's `main` to match upstream, which is a normal push, so Fly's existing continuous-deployment hook (set up once in §09) redeploys automatically from it. No CLI either way, but it is explicitly a manual check-in: nothing notifies the user that an update exists. Documented as a trade-off, not hidden as "automatic."
 
-## 15 Proposed repository layout
+## 16 Persisted OAuth state
+
+**Why**: with OAuth state purely in-process (§08), a machine restart — a redeploy, a crash, Fly host maintenance — wiped every registered client and issued token, forcing Claude to fully reconnect (re-run DCR, not just re-login) every time. Given that `fly.toml` already keeps the machine always-on (`auto_stop_machines = false`), restarts are infrequent, but "infrequent" isn't "never," and when it happens the failure mode was opaque to a non-technical deployer.
+
+**What's persisted, and what isn't**: registered OAuth clients and issued access tokens are written through to S3; pending logins and authorization codes are **not**. Both of the latter are single-use and expire in minutes (`LOGIN_ID_TTL_SECONDS` / `AUTH_CODE_TTL_SECONDS` in `auth.py`) — persisting them would only help a restart landing in a multi-second window mid-login, which isn't worth the complexity. A restart in that narrow window just means redoing that one login attempt, same as today.
+
+**Where it lives**: `state/.oauth.json`, in the same bucket and prefix the trainer's own memory uses (`s3store.py`'s `StateStore`), not a second bucket or prefix. This reuses one bucket/one set of credentials instead of provisioning a second storage concern, at the cost of needing a boundary between "the trainer's data" and "this server's own data" within that one prefix — see the dot-file rule below.
+
+**The dot-file reserved namespace**: any `var_name` starting with `.` is rejected by `state_create`, treated as not-found by `state_get`/`state_update`/`state_delete`, and never surfaced by `state_list` (`s3store.py`'s `ReservedNameError` / `_reject_reserved`). This is enforced at the `StateStore` layer, not just in the tool wrappers, so it holds regardless of how `state_*` is called. The trainer-facing tool docstrings say so, so the model doesn't try a dot-prefixed name and get a confusing rejection.
+
+**Encryption**: the persisted blob contains live bearer tokens, so it's encrypted with a dedicated secret, `OAUTH_STATE_SECRET` (via `cryptography`'s Fernet, key derived from the secret with SHA-256 + base64), before being written. Without this, anyone with the S3 credentials — which already grant read access to the trainer's own notes, so this isn't a new trust boundary for *that* data — would also get a live, working Claude session for free. `OAUTH_STATE_SECRET` is a third secret, independent of `OAUTH_USERNAME`/`OAUTH_PASSWORD`; rotating it just means the next load can't decrypt the old blob and degrades to a fresh one (one forced reconnect), not a crash.
+
+**Failure handling, consistent with §13's philosophy**: every persistence operation is best-effort. A missing file, a corrupted file, a wrong-secret decrypt failure, or an unreachable bucket during `load()` all degrade to an empty in-memory state rather than raising — worst case, that's one extra reconnect, never a crash. `save()` failures are logged and swallowed the same way; the in-process dicts remain correct regardless of whether the write-through succeeded.
+
+**Concurrency**: still one process, one machine (§02/§08/§09) — persistence does not change that. The only new race is two concurrent requests in the *same* process both triggering a write-through at once; an `asyncio.Lock` around `_persist()` in `auth.py` serializes those. No S3-level conditional-write machinery is needed.
+
+**What this is not**: refresh tokens. Persisting the *existing* access tokens and client registrations across a restart is unrelated to adding a refresh-token grant (still deliberately unsupported, §08/§10) — an access token that outlives the process still expires at its original one-hour mark either way.
+
+## 17 Proposed repository layout
 
 ```
 pyproject.toml
@@ -214,13 +235,15 @@ src/intervals_icu_s3_mcp/
   server.py        # FastMCP instance; composition root — wires OAuth, upstream.py, and state_* tools together
   upstream.py       # the abstraction layer: the ONLY module that imports/mounts the vendored package (§03)
   auth.py           # self-issued OAuth 2.1 provider (ported from datastore-mcp's SingleUserAuthProvider)
-  s3store.py         # boto3 client + state_* tool implementations
+  oauth_persistence.py # §16 — encrypted load/save of registered clients + access tokens to S3
+  s3store.py         # boto3 client + state_* tool implementations; enforces the dot-file reserved namespace (§16)
   config.py          # env var loading/validation
 tests/
   test_config.py                # unit tests for config.py
   test_server.py                # §13 — configured vs. misconfigured branching
-  test_auth.py                  # unit tests for the OAuth provider
-  test_s3store.py               # unit tests for state_* tools, mocked S3
+  test_auth.py                  # unit tests for the OAuth provider, incl. a restart-persistence simulation (§16)
+  test_oauth_persistence.py     # §16 — encrypt/decrypt roundtrip, degrade-on-missing/corrupt/wrong-secret
+  test_s3store.py               # unit tests for state_* tools, mocked S3, incl. dot-file rejection (§16)
   test_upstream_contract.py     # §04 — tool existence/shape vs. vendored package
   test_upstream_integration.py  # §04 — registration via upstream.py, no collisions
   test_e2e_smoke.py             # §04 — full OAuth + one upstream tool + one state_* tool, in-process

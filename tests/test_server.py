@@ -24,6 +24,7 @@ def _settings(**overrides):
         public_url="https://example.fly.dev",
         oauth_username="alice",
         oauth_password="s3cr3t",
+        oauth_state_secret="server-test-state-secret",
         bucket_name=BUCKET,
         aws_access_key_id="testing",
         aws_secret_access_key="testing",

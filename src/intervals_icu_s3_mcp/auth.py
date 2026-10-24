@@ -16,18 +16,24 @@ datastore-mcp's SingleUserAuthProvider does in Node/TS, ported to Python:
   mints an authorization code and completes the OAuth redirect.
 - Access tokens are opaque, one-hour TTL. No refresh tokens.
 - All state (registered clients, pending logins, issued codes, issued
-  tokens) lives in plain in-process dicts -- there is no database or file
-  backing it, which is why the deployment is pinned to one machine
-  (SPECIFICATION.md §02/§08).
+  tokens) lives in plain in-process dicts, which is still why the
+  deployment is pinned to one machine (SPECIFICATION.md §02/§08) -- but
+  registered clients and issued access tokens are now also written
+  through to S3 (optionally, via `persistence`; see oauth_persistence.py
+  and SPECIFICATION.md §15), so a machine *restart* doesn't force every
+  connected client to fully re-register and re-login. Pending logins and
+  authorization codes are deliberately NOT persisted -- both are
+  single-use and short-lived enough that it isn't worth the complexity.
 """
 
 from __future__ import annotations
 
+import asyncio
 import html
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp.server.auth import OAuthProvider
 from mcp.server.auth.provider import (
@@ -41,6 +47,9 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+if TYPE_CHECKING:
+    from .oauth_persistence import OAuthPersistence
 
 ACCESS_TOKEN_TTL_SECONDS = 3600
 LOGIN_ID_TTL_SECONDS = 600
@@ -62,10 +71,19 @@ class _PendingLogin:
 class SingleUserOAuthProvider(OAuthProvider):
     """One hardcoded username/password gate; no third-party IdP involved."""
 
-    def __init__(self, *, base_url: str, username: str, password: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        username: str,
+        password: str,
+        persistence: "OAuthPersistence | None" = None,
+    ) -> None:
         super().__init__(base_url=base_url)
         self._username = username
         self._password = password
+        self._persistence = persistence
+        self._persist_lock = asyncio.Lock()
 
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._pending_logins: dict[str, _PendingLogin] = {}
@@ -75,6 +93,43 @@ class SingleUserOAuthProvider(OAuthProvider):
         # ip -> list of failure timestamps, for the brute-force guard.
         self._login_failures: dict[str, list[float]] = {}
 
+        if persistence is not None:
+            self._load_persisted_state(persistence)
+
+    def _load_persisted_state(self, persistence: "OAuthPersistence") -> None:
+        state = persistence.load()
+        now = time.time()
+        for client_id, data in state.get("clients", {}).items():
+            try:
+                self._clients[client_id] = OAuthClientInformationFull.model_validate(data)
+            except Exception:  # noqa: BLE001 -- one bad record must not break the rest
+                continue
+        for token_value, data in state.get("access_tokens", {}).items():
+            try:
+                access_token = AccessToken.model_validate(data)
+            except Exception:  # noqa: BLE001
+                continue
+            if access_token.expires_at is None or access_token.expires_at >= now:
+                self._access_tokens[token_value] = access_token
+
+    async def _persist(self) -> None:
+        """Write-through: called after any mutation to clients/access_tokens."""
+        if self._persistence is None:
+            return
+        async with self._persist_lock:
+            now = time.time()
+            state = {
+                "clients": {
+                    cid: c.model_dump(mode="json") for cid, c in self._clients.items()
+                },
+                "access_tokens": {
+                    t: at.model_dump(mode="json")
+                    for t, at in self._access_tokens.items()
+                    if at.expires_at is None or at.expires_at >= now
+                },
+            }
+            await asyncio.to_thread(self._persistence.save, state)
+
     # -- Dynamic client registration -----------------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -82,6 +137,7 @@ class SingleUserOAuthProvider(OAuthProvider):
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
+        await self._persist()
 
     # -- Authorization: the login-gate diversion -------------------------
 
@@ -120,6 +176,7 @@ class SingleUserOAuthProvider(OAuthProvider):
             expires_at=int(time.time()) + ACCESS_TOKEN_TTL_SECONDS,
             subject=authorization_code.subject,
         )
+        await self._persist()
         return OAuthToken(
             access_token=token,
             token_type="Bearer",
@@ -158,6 +215,7 @@ class SingleUserOAuthProvider(OAuthProvider):
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         self._access_tokens.pop(token.token, None)
+        await self._persist()
 
     # -- The /login route itself (not part of the OAuth SDK's routes) ----
 

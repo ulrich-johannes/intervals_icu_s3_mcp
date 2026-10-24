@@ -7,6 +7,13 @@ state_delete never issues DeleteObject.
 Known trade-off (documented in the spec): S3 has no row locks or
 transactions, so the create-if-absent check below is a read-then-write, not
 atomic. Acceptable for a single-user, low-concurrency use case.
+
+Reserved namespace (SPECIFICATION.md §15): any var_name starting with "."
+is off limits to every one of these tools -- create/get/update/delete all
+reject it, and list() never surfaces it. That's not a trainer-memory
+feature; it's how this server's own internal state (persisted OAuth
+sessions, at `state/.oauth.json`) shares this same bucket and prefix
+without ever being reachable through the public tool surface.
 """
 
 from __future__ import annotations
@@ -28,6 +35,17 @@ class StateNotFoundError(KeyError):
 
 class StateConflictError(ValueError):
     """Raised by create() when var_name already exists and is not deleted."""
+
+
+class ReservedNameError(ValueError):
+    """Raised when var_name starts with "." -- reserved for internal use."""
+
+
+def _reject_reserved(var_name: str) -> None:
+    if var_name.startswith("."):
+        raise ReservedNameError(
+            f"var_name may not start with '.': {var_name!r} is reserved for internal use"
+        )
 
 
 @dataclass
@@ -80,6 +98,7 @@ class StateStore:
     def create(
         self, var_name: str, description: str | None = None, content: str | None = None
     ) -> dict[str, Any]:
+        _reject_reserved(var_name)
         existing = self._get_raw(var_name)
         now = _now()
         if existing is not None and not existing.deleted:
@@ -96,6 +115,8 @@ class StateStore:
         return record.to_dict()
 
     def get(self, var_name: str) -> dict[str, Any]:
+        if var_name.startswith("."):
+            raise StateNotFoundError(var_name)
         record = self._get_raw(var_name)
         if record is None or record.deleted:
             raise StateNotFoundError(var_name)
@@ -104,6 +125,8 @@ class StateStore:
     def update(
         self, var_name: str, description: str | None = None, content: str | None = None
     ) -> dict[str, Any]:
+        if var_name.startswith("."):
+            raise StateNotFoundError(var_name)
         record = self._get_raw(var_name)
         if record is None or record.deleted:
             raise StateNotFoundError(var_name)
@@ -116,6 +139,8 @@ class StateStore:
         return record.to_dict()
 
     def delete(self, var_name: str) -> dict[str, Any]:
+        if var_name.startswith("."):
+            raise StateNotFoundError(var_name)
         record = self._get_raw(var_name)
         if record is None or record.deleted:
             raise StateNotFoundError(var_name)
@@ -130,6 +155,8 @@ class StateStore:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=PREFIX):
             for obj in page.get("Contents", []):
                 var_name = obj["Key"][len(PREFIX) : -len(".json")]
+                if var_name.startswith("."):
+                    continue
                 record = self._get_raw(var_name)
                 if record is None:
                     continue

@@ -25,7 +25,8 @@ from starlette.responses import JSONResponse
 
 from .auth import SingleUserOAuthProvider
 from .config import Settings, load_settings, missing_env_vars
-from .s3store import StateConflictError, StateNotFoundError, StateStore
+from .oauth_persistence import OAuthPersistence
+from .s3store import ReservedNameError, StateConflictError, StateNotFoundError, StateStore
 from .upstream import missing_intervals_config, mount_upstream_tools
 
 
@@ -68,10 +69,28 @@ def build_misconfigured_app(missing: list[str]) -> FastMCP:
 
 
 def build_configured_app(settings: Settings) -> FastMCP:
+    store = StateStore(
+        bucket=settings.bucket_name,  # type: ignore[arg-type]
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        endpoint_url=settings.aws_endpoint_url_s3,
+        region_name=settings.aws_region,
+    )
+
+    # Persists registered OAuth clients + issued access tokens to the same
+    # bucket (SPECIFICATION.md §15), so a machine restart doesn't force
+    # every connected client to fully re-register and re-login. Loaded
+    # once, synchronously, right here at startup.
+    persistence = OAuthPersistence(
+        client=store.client,
+        bucket=store.bucket,
+        secret=settings.oauth_state_secret,  # type: ignore[arg-type]
+    )
     auth = SingleUserOAuthProvider(
         base_url=settings.public_url,  # type: ignore[arg-type]
         username=settings.oauth_username,  # type: ignore[arg-type]
         password=settings.oauth_password,  # type: ignore[arg-type]
+        persistence=persistence,
     )
     mcp = FastMCP("intervals-icu-s3-mcp", auth=auth)
 
@@ -83,13 +102,6 @@ def build_configured_app(settings: Settings) -> FastMCP:
     async def login(request: Request):
         return await auth.handle_login(request)
 
-    store = StateStore(
-        bucket=settings.bucket_name,  # type: ignore[arg-type]
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-        endpoint_url=settings.aws_endpoint_url_s3,
-        region_name=settings.aws_region,
-    )
     register_state_tools(mcp, store)
 
     mount_upstream_tools(mcp)
@@ -107,12 +119,16 @@ def register_state_tools(mcp: FastMCP, store: StateStore) -> None:
         """Create a new named value in the trainer's durable memory store.
 
         Fails with a conflict if var_name already exists and isn't deleted;
-        if it was soft-deleted, revives it with the new values.
+        if it was soft-deleted, revives it with the new values. var_name
+        may not start with "." -- that's reserved for this server's own
+        internal state.
         """
         try:
             return store.create(var_name, description=description, content=content)
         except StateConflictError as exc:
             return {"error": "conflict", "message": str(exc)}
+        except ReservedNameError as exc:
+            return {"error": "reserved_name", "message": str(exc)}
 
     @mcp.tool
     def state_get(var_name: str) -> dict[str, Any]:

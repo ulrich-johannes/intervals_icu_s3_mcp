@@ -27,6 +27,7 @@ REQUIRED_ENV_VARS: dict[str, str] = {
     "bucket_name": "BUCKET_NAME",
     "aws_access_key_id": "AWS_ACCESS_KEY_ID",
     "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
+    "oauth_state_secret": "OAUTH_STATE_SECRET",
 }
 
 
@@ -45,6 +46,10 @@ class Settings(BaseSettings):
     # Self-issued OAuth login gate (auth.py).
     oauth_username: str | None = None
     oauth_password: str | None = None
+
+    # Encrypts the persisted OAuth session state (SPECIFICATION.md §15)
+    # before it's written to S3 -- a made-up secret, unrelated to the two above.
+    oauth_state_secret: str | None = None
 
     # S3 / Tigris, as provisioned by `fly storage create` or Fly's Object
     # Storage dashboard page.

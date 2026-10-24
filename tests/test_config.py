@@ -7,6 +7,7 @@ REQUIRED_ENV = {
     "BUCKET_NAME": "my-bucket",
     "AWS_ACCESS_KEY_ID": "AKIA...",
     "AWS_SECRET_ACCESS_KEY": "shh",
+    "OAUTH_STATE_SECRET": "another-made-up-secret",
 }
 
 
@@ -67,4 +68,5 @@ def test_required_env_vars_cover_every_settings_dependency():
         "bucket_name",
         "aws_access_key_id",
         "aws_secret_access_key",
+        "oauth_state_secret",
     }

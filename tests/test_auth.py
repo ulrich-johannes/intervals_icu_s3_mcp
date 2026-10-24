@@ -1,11 +1,16 @@
+import boto3
 import pytest
 from mcp.server.auth.provider import AuthorizationParams, TokenError
 from mcp.shared.auth import OAuthClientInformationFull
+from moto import mock_aws
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from intervals_icu_s3_mcp.auth import SingleUserOAuthProvider
+from intervals_icu_s3_mcp.oauth_persistence import OAuthPersistence
+
+PERSISTENCE_BUCKET = "auth-persistence-test-bucket"
 
 USERNAME = "alice"
 PASSWORD = "s3cr3t"
@@ -167,3 +172,82 @@ def test_login_lockout_after_too_many_failures(provider, client_info):
             data={"login_id": login_id, "username": USERNAME, "password": PASSWORD},
         )
     assert resp.status_code == 429
+
+
+async def test_persisted_state_survives_a_restart(client_info):
+    """Simulates a machine restart: a second provider, built fresh against
+    the same persisted bucket, must see the first provider's registered
+    client and issued access token without redoing DCR or login."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=PERSISTENCE_BUCKET)
+
+        def new_provider():
+            persistence = OAuthPersistence(
+                client=s3, bucket=PERSISTENCE_BUCKET, secret="shared-secret"
+            )
+            return SingleUserOAuthProvider(
+                base_url="https://example.fly.dev",
+                username=USERNAME,
+                password=PASSWORD,
+                persistence=persistence,
+            )
+
+        first = new_provider()
+        await first.register_client(client_info)
+        params = _auth_params()
+        login_url = await first.authorize(client_info, params)
+        login_id = login_url.split("login_id=", 1)[1]
+
+        with TestClient(_login_app(first)) as c:
+            resp = c.post(
+                "/login",
+                data={"login_id": login_id, "username": USERNAME, "password": PASSWORD},
+                follow_redirects=False,
+            )
+        code = resp.headers["location"].split("code=", 1)[1].split("&", 1)[0]
+        auth_code = await first.load_authorization_code(client_info, code)
+        token = await first.exchange_authorization_code(client_info, auth_code)
+
+        # "restart": a brand new provider instance, nothing shared but the bucket.
+        second = new_provider()
+        assert await second.get_client(client_info.client_id) is not None
+        access_token = await second.load_access_token(token.access_token)
+        assert access_token is not None
+        assert access_token.client_id == client_info.client_id
+
+
+async def test_persisted_state_without_persistence_configured_is_a_noop():
+    provider = SingleUserOAuthProvider(
+        base_url="https://example.fly.dev", username=USERNAME, password=PASSWORD
+    )
+    client = OAuthClientInformationFull(client_id="c1")
+    await provider.register_client(client)  # must not raise with no persistence set
+    assert await provider.get_client("c1") is not None
+
+
+async def test_wrong_state_secret_does_not_crash_startup(client_info):
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=PERSISTENCE_BUCKET)
+
+        writer = SingleUserOAuthProvider(
+            base_url="https://example.fly.dev",
+            username=USERNAME,
+            password=PASSWORD,
+            persistence=OAuthPersistence(
+                client=s3, bucket=PERSISTENCE_BUCKET, secret="correct-secret"
+            ),
+        )
+        await writer.register_client(client_info)
+
+        reader = SingleUserOAuthProvider(
+            base_url="https://example.fly.dev",
+            username=USERNAME,
+            password=PASSWORD,
+            persistence=OAuthPersistence(
+                client=s3, bucket=PERSISTENCE_BUCKET, secret="wrong-secret"
+            ),
+        )
+        # degrades to empty state rather than raising
+        assert await reader.get_client(client_info.client_id) is None

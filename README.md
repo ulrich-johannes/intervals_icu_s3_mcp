@@ -90,6 +90,7 @@ If instead the bucket's page just shows you connection details (an access key, a
 | `PUBLIC_URL` | `https://` + your app's name (from Part 4) + `.fly.dev` — e.g. `https://my-trainer-mcp-ulrich.fly.dev` |
 | `OAUTH_USERNAME` | A username **you make up** — you'll use it to connect Claude later |
 | `OAUTH_PASSWORD` | A password **you make up** — pick something you'll remember; if you forget it, you just set a new one here later |
+| `OAUTH_STATE_SECRET` | Another password-like value **you make up** — you'll never type this one in anywhere again, it just protects your saved login sessions (see Part 9) |
 | `INTERVALS_ICU_API_KEY` | The API key from [Part 2](#part-2--get-your-intervalsicu-credentials) |
 | `INTERVALS_ICU_ATHLETE_ID` | Your Athlete ID from [Part 2](#part-2--get-your-intervalsicu-credentials) |
 | `INTERVALS_ICU_DELETE_MODE` | Type `safe` (recommended for most people — see Part 9 for other options) |
@@ -148,7 +149,8 @@ This is a manual check-in, not something that happens on its own — nothing wil
 | --- | --- | --- |
 | `PUBLIC_URL` | You type it in | Your server's own public web address |
 | `OAUTH_USERNAME` / `OAUTH_PASSWORD` | You make these up | The login Claude uses to connect to *your* server — nothing to do with your intervals.icu password |
-| `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION` | Fly.io's storage dashboard (Part 5) | Where the trainer's notes/memory are stored |
+| `OAUTH_STATE_SECRET` | You make this up too | Protects your saved Claude login session (stored in your storage bucket) so a machine restart doesn't force you to fully reconnect every time |
+| `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION` | Fly.io's storage dashboard (Part 5) | Where the trainer's notes/memory — and your saved login session — are stored |
 | `INTERVALS_ICU_API_KEY` | intervals.icu → Settings → Developer Settings | Lets the server read/write your intervals.icu data |
 | `INTERVALS_ICU_ATHLETE_ID` | intervals.icu → Settings → Developer Settings | Identifies which athlete's data to use |
 | `INTERVALS_ICU_DELETE_MODE` | You choose: `safe` (default), `full`, or `none` | Controls whether destructive tools (e.g. deleting an activity) are available at all. `safe` is recommended for most people; `none` disables all delete tools entirely; `full` enables everything |
@@ -163,6 +165,7 @@ None of your credentials are ever stored in this project's code — they only ex
 - **`/health` doesn't show `{"status":"ok"}`** → open your app's **Logs** on the Fly.io dashboard to see what went wrong; the most common cause is a missing or misspelled secret from Part 6, or forgetting to redeploy after adding them (Part 7).
 - **Claude says it can't connect** → double check the URL ends in `/mcp` (not `/health` or nothing at all), and that you typed the `OAUTH_USERNAME`/`OAUTH_PASSWORD` from Part 6 correctly on the login screen.
 - **Forgot your `OAUTH_PASSWORD`** → go to Secrets on the Fly.io dashboard, edit `OAUTH_PASSWORD` to a new value, redeploy, then reconnect in Claude with the new password.
+- **Claude keeps asking you to log in again** → this should now be rare (your login session is saved in your storage bucket, so a normal restart doesn't clear it), but changing `OAUTH_STATE_SECRET` itself, or recreating your storage bucket, does — in both cases, just reconnect once in Claude's Connectors settings.
 
 ---
 

@@ -2,7 +2,12 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from intervals_icu_s3_mcp.s3store import StateConflictError, StateNotFoundError, StateStore
+from intervals_icu_s3_mcp.s3store import (
+    ReservedNameError,
+    StateConflictError,
+    StateNotFoundError,
+    StateStore,
+)
 
 BUCKET = "test-bucket"
 
@@ -90,3 +95,33 @@ def test_list_include_deleted(store):
     listed = store.list(include_deleted=True)
     names = {r["var_name"] for r in listed}
     assert names == {"a", "b"}
+
+
+def test_create_rejects_dot_prefixed_var_name(store):
+    with pytest.raises(ReservedNameError):
+        store.create(".oauth", content="nope")
+
+
+def test_get_dot_prefixed_reads_as_not_found(store):
+    with pytest.raises(StateNotFoundError):
+        store.get(".oauth")
+
+
+def test_update_dot_prefixed_reads_as_not_found(store):
+    with pytest.raises(StateNotFoundError):
+        store.update(".oauth", content="nope")
+
+
+def test_delete_dot_prefixed_reads_as_not_found(store):
+    with pytest.raises(StateNotFoundError):
+        store.delete(".oauth")
+
+
+def test_list_never_surfaces_internal_files(store):
+    store.create("visible", description="fine")
+    # simulate our own internal state sharing the same bucket/prefix
+    store.client.put_object(Bucket=BUCKET, Key="state/.oauth.json", Body=b"{}")
+
+    listed = store.list(include_deleted=True)
+    names = {r["var_name"] for r in listed}
+    assert names == {"visible"}
