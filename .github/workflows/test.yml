@@ -1,0 +1,28 @@
+# Required CI check (SPECIFICATION.md §04): runs the regression suite --
+# our own unit tests plus the upstream contract/integration/e2e-smoke
+# tests -- on every push and PR, including a submodule bump. Deploy
+# itself stays on Fly's native GitHub integration (no workflow here for
+# that); this workflow's only job is to be a required status check that
+# blocks merging to `main` before Fly ever builds it.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - run: uv sync --all-extras --dev
+
+      - run: uv run pytest -q

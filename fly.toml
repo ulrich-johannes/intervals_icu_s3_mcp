@@ -1,0 +1,19 @@
+# SPECIFICATION.md §09 -- single always-on machine, same rationale as
+# datastore-mcp: OAuth state (registered clients, pending logins, issued
+# tokens) lives in-process, so a second machine would silently diverge.
+# App name, region, and machine size are placeholders -- see Open items §11.
+app = "intervals-icu-s3-mcp"
+primary_region = "ams"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

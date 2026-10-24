@@ -1,0 +1,3 @@
+[submodule "vendor/intervals-icu-mcp"]
+	path = vendor/intervals-icu-mcp
+	url = https://github.com/hhopke/intervals-icu-mcp

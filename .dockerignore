@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.env
+.git
+vendor/intervals-icu-mcp/.git
+tests/
+.pytest_cache
+.ruff_cache
