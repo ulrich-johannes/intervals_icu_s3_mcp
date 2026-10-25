@@ -249,19 +249,172 @@ class SingleUserOAuthProvider(OAuthProvider):
 
     @staticmethod
     def _login_form(login_id: str, error: str | None = None) -> str:
-        error_html = f'<p style="color:red">{html.escape(error)}</p>' if error else ""
+        error_html = (
+            f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
+        )
         safe_login_id = html.escape(login_id)
         return f"""<!doctype html>
-<html><body>
-<h1>Sign in</h1>
-{error_html}
-<form method="post" action="/login">
-  <input type="hidden" name="login_id" value="{safe_login_id}">
-  <label>Username <input type="text" name="username" autofocus></label><br>
-  <label>Password <input type="password" name="password"></label><br>
-  <button type="submit">Sign in</button>
-</form>
-</body></html>"""
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<style>
+  :root {{
+    --bg: #f4f5f7;
+    --card-bg: #ffffff;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --border: #e2e4e9;
+    --accent: #4f46e5;
+    --accent-hover: #4338ca;
+    --error-bg: #fef2f2;
+    --error-text: #b91c1c;
+    --error-border: #fecaca;
+    --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.08);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #0f1115;
+      --card-bg: #181b21;
+      --text: #f2f3f5;
+      --muted: #9aa1ac;
+      --border: #2a2e37;
+      --accent: #6366f1;
+      --accent-hover: #818cf8;
+      --error-bg: #2a1518;
+      --error-text: #fca5a5;
+      --error-border: #5b2228;
+      --shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.4);
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 380px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    padding: 36px 32px;
+  }}
+  .icon {{
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 20px;
+  }}
+  .icon svg {{ width: 22px; height: 22px; stroke: #fff; }}
+  h1 {{
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }}
+  .subtitle {{
+    font-size: 14px;
+    color: var(--muted);
+    margin: 0 0 24px;
+  }}
+  .error {{
+    background: var(--error-bg);
+    color: var(--error-text);
+    border: 1px solid var(--error-border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 14px;
+    margin: 0 0 20px;
+  }}
+  label {{
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }}
+  .field {{ margin-bottom: 18px; }}
+  input[type="text"],
+  input[type="password"] {{
+    width: 100%;
+    padding: 10px 12px;
+    font-size: 15px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }}
+  input[type="text"]:focus,
+  input[type="password"]:focus {{
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  }}
+  button {{
+    width: 100%;
+    padding: 11px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    margin-top: 6px;
+    transition: background 0.15s ease;
+  }}
+  button:hover {{ background: var(--accent-hover); }}
+  button:active {{ transform: translateY(1px); }}
+  .footer {{
+    margin-top: 24px;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+  }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">
+    <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="11" width="18" height="10" rx="2"></rect>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+    </svg>
+  </div>
+  <h1>Sign in</h1>
+  <p class="subtitle">Enter your credentials to continue to your coach's MCP server.</p>
+  {error_html}
+  <form method="post" action="/login">
+    <input type="hidden" name="login_id" value="{safe_login_id}">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="footer">This login is private to your own deployment.</p>
+</div>
+</body>
+</html>"""
 
     async def handle_login(self, request: Request) -> Response:
         self._purge_expired()
