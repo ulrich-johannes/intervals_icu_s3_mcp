@@ -65,16 +65,48 @@ Fly.io also sets this app up for **continuous deployment**: from now on, any fut
 
 ## Part 5 — Create your private storage bucket
 
-This is where the trainer's notes and memory will actually live.
+This is where the trainer's notes and memory will actually live. Storage here is Tigris, a service built into Fly.io.
+
+**Important: create the bucket through Fly's own "attach storage to this app" flow, not by creating an access key separately in a Tigris console.** Doing it the first way makes Fly generate a key that already has the correct permissions on your bucket, bundled together automatically. Doing it the second way gives you a key that technically exists and looks right (correct bucket name, correct credentials) but has **zero permissions** on anything — every read and write fails with `AccessDenied`, even though nothing looks obviously wrong. If you hit that exact symptom, skip ahead to [the fix below](#if-everything-returns-access-denied-even-though-your-secrets-look-right).
 
 1. On the Fly.io dashboard, find your way to **Object Storage** (sometimes listed under your organization's settings, sometimes as its own section in the sidebar — Fly calls this service "Tigris").
-2. Click **Create bucket** (or **"Add storage"**).
+2. Click **Create bucket** (or **"Add storage"**) — and specifically look for a version of this flow that asks **which app to attach it to**. That app-picker step is what makes Fly wire up the permissions correctly.
 3. Give it any name you like, e.g. `trainer-memory`.
-4. When asked which app to attach it to, choose the app you created in Part 4.
+4. Choose the app you created in Part 4.
 
-If Fly's dashboard attaches the bucket to your app automatically, it should also add the right secrets for you — check Part 6 below; if you already see entries like `BUCKET_NAME` and `AWS_ACCESS_KEY_ID` listed there, this step is done and you can skip adding them manually.
+If Fly's dashboard attaches the bucket to your app automatically this way, it should also add the right secrets for you — check Part 6 below; if you already see entries like `BUCKET_NAME` and `AWS_ACCESS_KEY_ID` listed there, this step is done and you can skip adding them manually.
 
-If instead the bucket's page just shows you connection details (an access key, a secret key, an endpoint address, a bucket name) without attaching anything automatically, that's fine too — just keep that page open, you'll copy those values into secrets manually in the next part.
+If instead the bucket's page just shows you connection details (an access key, a secret key, an endpoint address, a bucket name) without an app-attach step, that's still fine — just keep that page open, you'll copy those values into secrets manually in the next part. Just be aware that if those values came from a key created *outside* an app-attach flow, you may need the fix in the next section too.
+
+### If everything returns "Access Denied" even though your secrets look right
+
+Symptom: the app runs, `/health` says `"configured":true`, every secret is spelled correctly and points at the right bucket — but every read or write through Claude fails, and Fly's logs show `AccessDenied` on object operations.
+
+This means the access key exists and is genuinely yours, but has no permissions attached to it — a known Tigris behavior when a key is created outside Fly's attach-to-app flow (see Tigris's own docs: [IAM overview](https://tigrisdata.com/docs/iam), [limited access keys](https://www.tigrisdata.com/docs/iam/policies/limited-access-key), [attaching a policy](https://www.tigrisdata.com/docs/iam/policies/attach-iam-policy/)). Fix it by attaching a policy to the key:
+
+1. On Tigris's dashboard, open **IAM Policies** and create a new policy (JSON editor), using your actual bucket name in place of `coachdata`:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "AllowListingBucket",
+         "Effect": "Allow",
+         "Action": ["s3:ListBucket"],
+         "Resource": "arn:aws:s3:::coachdata"
+       },
+       {
+         "Sid": "AllowReadWriteObjects",
+         "Effect": "Allow",
+         "Action": ["s3:GetObject", "s3:PutObject"],
+         "Resource": "arn:aws:s3:::coachdata/*"
+       }
+     ]
+   }
+   ```
+   (`s3:DeleteObject` is deliberately left out — this app never issues one; `state_delete` only soft-deletes.)
+2. Open that policy's details, click **"Manage IAM Policy"** → **"Linked Access Keys"** → **"+ Link"**, and attach it to your access key (the `tid_...` value from your `AWS_ACCESS_KEY_ID` secret).
+3. No redeploy needed — this is a Tigris-side permission change, not an app setting. Try again through Claude right away.
 
 ---
 
@@ -150,10 +182,15 @@ This is a manual check-in, not something that happens on its own — nothing wil
 | `PUBLIC_URL` | You type it in | Your server's own public web address |
 | `OAUTH_USERNAME` / `OAUTH_PASSWORD` | You make these up | The login Claude uses to connect to *your* server — nothing to do with your intervals.icu password |
 | `OAUTH_STATE_SECRET` | You make this up too | Protects your saved Claude login session (stored in your storage bucket) so a machine restart doesn't force you to fully reconnect every time |
-| `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION` | Fly.io's storage dashboard (Part 5) | Where the trainer's notes/memory — and your saved login session — are stored |
+| `BUCKET_NAME` | Fly.io's storage dashboard (Part 5) | The bucket name |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Fly.io's storage dashboard (Part 5) | Tigris credentials — must be a key created through the app-attach flow, or one with a policy attached by hand (see Part 5's troubleshooting box) |
+| `AWS_ENDPOINT_URL_S3` | Fly.io's storage dashboard (Part 5) | Tigris's S3-compatible API address — currently `https://t3.storage.dev` |
+| `AWS_REGION` | Fly.io's storage dashboard (Part 5) | Almost always `auto` for Tigris |
 | `INTERVALS_ICU_API_KEY` | intervals.icu → Settings → Developer Settings | Lets the server read/write your intervals.icu data |
 | `INTERVALS_ICU_ATHLETE_ID` | intervals.icu → Settings → Developer Settings | Identifies which athlete's data to use |
 | `INTERVALS_ICU_DELETE_MODE` | You choose: `safe` (default), `full`, or `none` | Controls whether destructive tools (e.g. deleting an activity) are available at all. `safe` is recommended for most people; `none` disables all delete tools entirely; `full` enables everything |
+
+You may also see an `AWS_ENDPOINT_URL_IAM` secret appear (`https://iam.storage.dev`) when Fly provisions Tigris storage — this app doesn't read or need it; it's only relevant if you end up managing IAM policies by hand (Part 5's troubleshooting box).
 
 None of your credentials are ever stored in this project's code — they only exist as Fly.io "secrets," which are encrypted and only readable by your own running app.
 
@@ -166,6 +203,7 @@ None of your credentials are ever stored in this project's code — they only ex
 - **Claude says it can't connect** → double check the URL ends in `/mcp` (not `/health` or nothing at all), and that you typed the `OAUTH_USERNAME`/`OAUTH_PASSWORD` from Part 6 correctly on the login screen.
 - **Forgot your `OAUTH_PASSWORD`** → go to Secrets on the Fly.io dashboard, edit `OAUTH_PASSWORD` to a new value, redeploy, then reconnect in Claude with the new password.
 - **Claude keeps asking you to log in again** → this should now be rare (your login session is saved in your storage bucket, so a normal restart doesn't clear it), but changing `OAUTH_STATE_SECRET` itself, or recreating your storage bucket, does — in both cases, just reconnect once in Claude's Connectors settings.
+- **The trainer says it couldn't read or save its notes ("access denied")** → see [Part 5's troubleshooting box](#if-everything-returns-access-denied-even-though-your-secrets-look-right); this is almost always a Tigris access key with no permissions attached, not a secret that's wrong or missing.
 
 ---
 
