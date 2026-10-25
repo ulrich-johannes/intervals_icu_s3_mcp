@@ -44,6 +44,7 @@ from mcp.server.auth.provider import (
     RefreshToken,
     TokenError,
 )
+from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -79,7 +80,18 @@ class SingleUserOAuthProvider(OAuthProvider):
         password: str,
         persistence: "OAuthPersistence | None" = None,
     ) -> None:
-        super().__init__(base_url=base_url)
+        # The MCP SDK's ClientRegistrationOptions defaults to enabled=False,
+        # which silently drops the /register route and the
+        # registration_endpoint from the metadata -- a client then sees no
+        # way to self-register and asks the human for a manually-issued
+        # Client ID instead (which we don't have, since we never pre-issue
+        # one). Open DCR is the whole point of this design (see the module
+        # docstring and SPECIFICATION.md §08), so it must be turned on
+        # explicitly here.
+        super().__init__(
+            base_url=base_url,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        )
         self._username = username
         self._password = password
         self._persistence = persistence

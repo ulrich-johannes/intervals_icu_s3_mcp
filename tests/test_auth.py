@@ -49,6 +49,16 @@ def _login_app(provider):
     return Starlette(routes=[Route("/login", provider.handle_login, methods=["GET", "POST"])])
 
 
+def test_registration_endpoint_is_actually_exposed(provider):
+    # Regression test: the MCP SDK's ClientRegistrationOptions defaults to
+    # enabled=False, which silently drops the /register route -- a client
+    # then reports DCR as unsupported and asks for a manually-issued
+    # Client ID, which this server has no concept of. See auth.py.
+    paths = [route.path for route in provider.get_routes()]
+    assert "/register" in paths
+    assert provider.client_registration_options.enabled is True
+
+
 async def test_register_client_then_get_client(provider, client_info):
     await provider.register_client(client_info)
     fetched = await provider.get_client("client-123")
